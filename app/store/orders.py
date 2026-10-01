@@ -1,5 +1,6 @@
 import sqlite3
 
+from app.store import payments as payment_store
 from app.store.db import connect
 
 
@@ -21,13 +22,15 @@ def get(tenant: str, order_id: str) -> dict | None:
             "FROM orders WHERE tenant=? AND order_id=?",
             (tenant, order_id),
         ).fetchone()
+        if row is None:
+            return None
+        # 收款流水随订单一起暴露，按登记顺序排列
+        flows = payment_store.list_for_order(tenant, order_id, conn=conn)
     finally:
         conn.close()
-    if row is None:
-        return None
-    return order_view(row)
+    return order_view(row, flows)
 
-def order_view(row: sqlite3.Row) -> dict:
+def order_view(row: sqlite3.Row, payment_flows: list[dict] | None = None) -> dict:
     amount = row["amount_cents"]
     outstanding = amount - row["paid_cents"]
     refundable = amount - row["refunded_cents"]
@@ -37,27 +40,5 @@ def order_view(row: sqlite3.Row) -> dict:
         "outstanding_cents": outstanding,
         "refundable_cents": refundable,
         "settleable_cents": settleable,
+        "payments": payment_flows or [],
     }
-
-def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
-    conn = connect()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT amount_cents, paid_cents, refunded_cents FROM orders WHERE tenant=? AND order_id=?",
-            (tenant, order_id),
-        ).fetchone()
-        if row is None:
-            conn.execute("ROLLBACK")
-            return None
-        if amount_cents <= 0 or row["paid_cents"] + amount_cents > row["amount_cents"]:
-            conn.execute("ROLLBACK")
-            raise ValueError("payment exceeds outstanding amount")
-        conn.execute(
-            "UPDATE orders SET paid_cents = paid_cents + ?, status = CASE WHEN paid_cents + ? >= amount_cents THEN 'settled' ELSE 'accepted' END WHERE tenant=? AND order_id=?",
-            (amount_cents, amount_cents, tenant, order_id),
-        )
-        conn.execute("COMMIT")
-    finally:
-        conn.close()
-    return get(tenant, order_id)

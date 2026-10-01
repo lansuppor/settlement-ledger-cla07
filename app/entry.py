@@ -1,10 +1,10 @@
 import argparse
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders, refunds, settlements
+from app.store import orders, payments, refunds, settlements
 from app.store.db import connect, migrate
 
 app = FastAPI(title="settlement-ledger")
@@ -17,6 +17,7 @@ class OrderIn(BaseModel):
 
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
 
 class RefundIn(BaseModel):
     refund_id: str = Field(min_length=1)
@@ -62,21 +63,93 @@ def read_order(order_id: str, x_tenant: str = Header(default="")) -> dict:
     return order
 
 @app.post("/orders/{order_id}/payments")
-def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="")) -> dict:
+def register_order_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="")) -> dict:
     tenant = _require_tenant(x_tenant)
     try:
-        order = orders.add_payment(tenant, order_id, body.amount_cents)
-    except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error))
-    if order is None:
+        result, payment = payments.register(
+            tenant, order_id, body.amount_cents, body.idempotency_key
+        )
+    except payments.PaymentExceedsOutstanding:
+        # 累计已收不得超过订单金额；不改动订单与既有收款流水
+        raise HTTPException(status_code=409, detail="payment exceeds outstanding amount")
+    if result == "order_not_found":
+        # 订单不存在或属于其他租户，一律按不存在处理
         raise HTTPException(status_code=404, detail="order not found")
-    return order
+    # 首次登记与同幂等键超时重试均返回 200 与流水；重试命中首次结论，
+    # 不产生第二条流水（返回的 payment_id 与首次相同，可观察）
+    return payment
+
+
+@app.get("/payments/{payment_id}")
+def read_payment(payment_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    payment = payments.get(tenant, payment_id)
+    if payment is None:
+        # 流水不存在或属于其他租户，一律按不存在处理
+        raise HTTPException(status_code=404, detail="payment not found")
+    return payment
+
+
+@app.post("/payments/{payment_id}/reverse")
+def reverse_payment(payment_id: str, x_tenant: str = Header(default="")) -> dict:
+    tenant = _require_tenant(x_tenant)
+    try:
+        payment = payments.reverse(tenant, payment_id)
+    except payments.PaymentAlreadyReversed:
+        # 与“流水不存在”可区分
+        raise HTTPException(status_code=409, detail="payment already reversed")
+    if payment is None:
+        # 未登记的流水标识（含跨租户）一律按不存在处理
+        raise HTTPException(status_code=404, detail="payment not found")
+    return payment
+
+
+@app.get("/payments")
+def search_payments(
+    order_id: str | None = Query(default=None),
+    min_amount_cents: int | None = Query(default=None),
+    max_amount_cents: int | None = Query(default=None),
+    created_from: str | None = Query(default=None, description="ISO-8601，含"),
+    created_to: str | None = Query(default=None, description="ISO-8601，含"),
+    reversed_only: bool | None = Query(default=None),
+    cursor: int | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    x_tenant: str = Header(default=""),
+) -> dict:
+    tenant = _require_tenant(x_tenant)
+    if min_amount_cents is not None and min_amount_cents <= 0:
+        raise HTTPException(status_code=400, detail="min_amount_cents must be positive")
+    if max_amount_cents is not None and max_amount_cents <= 0:
+        raise HTTPException(status_code=400, detail="max_amount_cents must be positive")
+    if (
+        min_amount_cents is not None
+        and max_amount_cents is not None
+        and min_amount_cents > max_amount_cents
+    ):
+        raise HTTPException(status_code=400, detail="amount range is invalid")
+    try:
+        return payments.search(
+            tenant,
+            order_id=order_id,
+            min_amount_cents=min_amount_cents,
+            max_amount_cents=max_amount_cents,
+            created_from=created_from,
+            created_to=created_to,
+            reversed_only=reversed_only,
+            cursor=cursor,
+            limit=limit,
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid created_from/created_to, expect ISO-8601")
 
 @app.post("/refunds", status_code=201)
 def accept_refund(body: RefundIn, x_tenant: str = Header(default="")) -> dict:
     tenant = _require_tenant(x_tenant)
     try:
         result, refund = refunds.accept(tenant, body.refund_id, body.order_id, body.amount_cents)
+    except payments.OrderReopenedByReversal:
+        # 曾结清但因收款冲正使未收重新 > 0：与普通“未结清”可区分
+        raise HTTPException(status_code=409, detail="order reopened by payment reversal")
     except refunds.OrderNotSettled:
         # 未收金额不为 0：订单尚未结清
         raise HTTPException(status_code=409, detail="order is not settled")
@@ -123,6 +196,9 @@ def accept_settlement(body: SettlementIn, x_tenant: str = Header(default="")) ->
         result, settlement = settlements.accept(
             tenant, body.settlement_id, body.order_id, body.amount_cents
         )
+    except payments.OrderReopenedByReversal:
+        # 曾结清但因收款冲正使未收重新 > 0：与普通“未结清”可区分
+        raise HTTPException(status_code=409, detail="order reopened by payment reversal")
     except settlements.OrderNotSettled:
         # 未收金额不为 0：订单尚未结清
         raise HTTPException(status_code=409, detail="order is not settled")

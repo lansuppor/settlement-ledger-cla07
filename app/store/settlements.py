@@ -1,6 +1,7 @@
 import sqlite3
 from datetime import UTC, datetime
 
+from app.store import payments as payment_store
 from app.store.db import connect
 
 
@@ -91,7 +92,11 @@ def accept(tenant: str, settlement_id: str, order_id: str, amount_cents: int) ->
             return "order_not_found", {}
 
         if order["amount_cents"] - order["paid_cents"] > 0:
+            reopened = payment_store.has_reversed(tenant, order_id, conn)
             conn.execute("ROLLBACK")
+            # 因收款冲正使未收重新 > 0：拒绝原因与“从未结清”可区分
+            if reopened:
+                raise payment_store.OrderReopenedByReversal("order reopened by payment reversal")
             raise OrderNotSettled("order is not settled")
 
         if order["refunded_cents"] != 0:
