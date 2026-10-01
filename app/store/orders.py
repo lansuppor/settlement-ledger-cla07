@@ -1,5 +1,7 @@
 import sqlite3
+
 from app.store.db import connect
+
 
 def insert(tenant: str, order_id: str, amount_cents: int, currency: str) -> None:
     conn = connect()
@@ -15,22 +17,31 @@ def get(tenant: str, order_id: str) -> dict | None:
     conn = connect()
     try:
         row = conn.execute(
-            "SELECT tenant, order_id, amount_cents, paid_cents, currency, status FROM orders WHERE tenant=? AND order_id=?",
+            "SELECT tenant, order_id, amount_cents, paid_cents, refunded_cents, currency, status FROM orders WHERE tenant=? AND order_id=?",
             (tenant, order_id),
         ).fetchone()
     finally:
         conn.close()
     if row is None:
         return None
-    outstanding = row["amount_cents"] - row["paid_cents"]
-    return {**dict(row), "outstanding_cents": outstanding}
+    return order_view(row)
+
+def order_view(row: sqlite3.Row) -> dict:
+    amount = row["amount_cents"]
+    outstanding = amount - row["paid_cents"]
+    refundable = amount - row["refunded_cents"]
+    return {
+        **dict(row),
+        "outstanding_cents": outstanding,
+        "refundable_cents": refundable,
+    }
 
 def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT amount_cents, paid_cents FROM orders WHERE tenant=? AND order_id=?",
+            "SELECT amount_cents, paid_cents, refunded_cents FROM orders WHERE tenant=? AND order_id=?",
             (tenant, order_id),
         ).fetchone()
         if row is None:

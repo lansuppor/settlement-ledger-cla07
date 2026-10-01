@@ -1,6 +1,6 @@
 # 经营单据与结算服务
 
-本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
+本地可运行的多租户经营单据服务。当前支持受理订单、按标识读取订单、登记收款并核对未收金额，以及受理/读取/冲正退款单；数据落本地 SQLite 文件库，服务为单进程 HTTP 服务。
 
 ## 环境与安装
 
@@ -9,7 +9,8 @@
 
 ## 启动
 
-- `python3 -m app.entry --port 8000`
+- `python3 -m app.entry --port 8000`（首次启动自动执行迁移）
+- 仅执行数据库迁移：`python3 -m app.entry --migrate`
 - 健康检查：`GET /health`
 
 ## 测试
@@ -19,19 +20,64 @@
 
 ## 已有公开接口
 
+订单与收款：
+
 - `POST /orders`：受理订单。请求字段 `tenant`、`order_id`、`amount_cents`、`currency`。成功返回 201 与订单对象；参数不合法返回 400；同一租户重复受理返回 409。
 - `GET /orders/{order_id}`：按标识读取订单。租户通过请求头 `X-Tenant` 传入；不存在返回 404；跨租户读取返回 404（不泄漏对象是否存在）。
 - `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`；超过未收金额返回 409；成功返回 200 与订单的 `paid_cents`、`outstanding_cents`。
 - `GET /health`：返回服务与数据库状态。
 
+退款单（独立单据，租户同样通过请求头 `X-Tenant` 声明）：
+
+- `POST /refunds`：受理退款单。请求字段 `refund_id`、`order_id`、`amount_cents`（最小货币单位整数，> 0）。成功返回 201 与退款单对象（状态 `accepted`）。
+  - 原订单不存在或属于其他租户：`404 order not found`（两者不可区分）。
+  - 订单未结清（未收金额 > 0）：`409 order is not settled`。
+  - 退款金额超过可退余额（订单金额 − 累计已退金额）：`409 refund exceeds refundable amount`。
+  - 同一（租户，退款单标识）重复受理：`409 refund already accepted`，命中首次受理结论，不二次入账、不改变首次单据。
+  - 该标识此前已冲正：`409 refund already reversed`，冲正后同一标识不得再次受理。
+- `GET /refunds/{refund_id}`：读取退款单。不存在或跨租户返回 404。
+- `POST /refunds/{refund_id}/reverse`：冲正退款单。仅 `accepted` 可冲正，成功返回 200 与状态 `reversed` 的退款单；未受理标识（含跨租户）返回 `404 refund not found`，重复冲正返回 `409 refund already reversed`。
+
+受理成功后订单对象额外暴露：
+
+- `refunded_cents`：累计已退金额（不含已冲正部分）。
+- `refundable_cents`：当前可退余额 = `amount_cents − refunded_cents`。
+- 守恒关系：`refunded_cents + refundable_cents = amount_cents`；退款不改写 `paid_cents` 与收款记录，`outstanding_cents` 保持为 0。
+
+### 调用示例
+
+```bash
+T="-H X-Tenant:t1"
+# 1. 建单并收清
+curl -s -X POST localhost:8000/orders -H 'Content-Type: application/json' \
+  -d '{"tenant":"t1","order_id":"o-1","amount_cents":500,"currency":"CNY"}'
+curl -s -X POST localhost:8000/orders/o-1/payments $T -H 'Content-Type: application/json' \
+  -d '{"amount_cents":500}'
+# 2. 受理退款单
+curl -s -X POST localhost:8000/refunds $T -H 'Content-Type: application/json' \
+  -d '{"refund_id":"rf-1","order_id":"o-1","amount_cents":200}'
+# 3. 读取订单（观察 refunded_cents / refundable_cents）与退款单
+curl -s localhost:8000/orders/o-1 $T
+curl -s localhost:8000/refunds/rf-1 $T
+# 4. 冲正
+curl -s -X POST localhost:8000/refunds/rf-1/reverse $T
+```
+
 ## 数据与配置
 
 - 数据库文件默认 `var/app.sqlite`（不入库）。
 - 环境变量：`APP_DB`（数据库路径）、`APP_PORT`（监听端口）、`APP_TENANT_HEADER`（默认 `X-Tenant`）。
+- 迁移文件位于 `migrations/`，按文件名顺序执行并在 `schema_migrations` 表记录版本，重启重复执行不生效、不丢数据。
+
+## 一致性说明
+
+- 退款受理的判重、订单校验、退款单落库、累计已退更新在单个 SQLite 立即事务内完成：任一失败整体回滚，不留部分数据；同一退款单标识并发受理最多一个成功，金额绝不重复累计。
+- 收款与退款分属两条金额链路：`paid_cents`/收款记录不被退款改写，退款只影响 `refunded_cents`，冲正则整体减回。
+- 已受理/已冲正状态持久化，服务重启后仍可判定，可继续冲正或受理新的退款。
 
 ## 当前限制
 
-- 单进程运行，单库写入，未做连接池与写并发调优。
+- 单进程运行，单库写入，未做连接池与写并发调优（写事务串行化，依赖 SQLite 行级写锁与重试）。
 - 租户通过请求头声明，未接入真实身份提供方。
 - 无缓存层；批量导入只支持小样本同步方式。
-- 收款只支持整单登记，未实现分期、退款与对账。
+- 收款只支持整单登记，未实现分期与对账。
