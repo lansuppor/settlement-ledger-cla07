@@ -38,26 +38,3 @@ def order_view(row: sqlite3.Row) -> dict:
         "refundable_cents": refundable,
         "settleable_cents": settleable,
     }
-
-def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
-    conn = connect()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT amount_cents, paid_cents, refunded_cents FROM orders WHERE tenant=? AND order_id=?",
-            (tenant, order_id),
-        ).fetchone()
-        if row is None:
-            conn.execute("ROLLBACK")
-            return None
-        if amount_cents <= 0 or row["paid_cents"] + amount_cents > row["amount_cents"]:
-            conn.execute("ROLLBACK")
-            raise ValueError("payment exceeds outstanding amount")
-        conn.execute(
-            "UPDATE orders SET paid_cents = paid_cents + ?, status = CASE WHEN paid_cents + ? >= amount_cents THEN 'settled' ELSE 'accepted' END WHERE tenant=? AND order_id=?",
-            (amount_cents, amount_cents, tenant, order_id),
-        )
-        conn.execute("COMMIT")
-    finally:
-        conn.close()
-    return get(tenant, order_id)

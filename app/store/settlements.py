@@ -8,6 +8,10 @@ class OrderNotSettled(Exception):
     """订单未结清（未收金额不为 0），不能受理结算单。"""
 
 
+class OrderPaymentReversed(Exception):
+    """订单曾结清，但收款被冲正导致未收重新大于 0，不能受理结算单。"""
+
+
 class OrderHasRefunds(Exception):
     """订单已发生退款（累计已退金额不为 0），不能受理结算单。"""
 
@@ -81,7 +85,7 @@ def accept(tenant: str, settlement_id: str, order_id: str, amount_cents: int) ->
             return result, _settlement_view(existing)
 
         order = conn.execute(
-            "SELECT amount_cents, paid_cents, refunded_cents, settled_cents, currency FROM orders "
+            "SELECT amount_cents, paid_cents, refunded_cents, settled_cents, ever_settled, currency FROM orders "
             "WHERE tenant=? AND order_id=?",
             (tenant, order_id),
         ).fetchone()
@@ -92,6 +96,9 @@ def accept(tenant: str, settlement_id: str, order_id: str, amount_cents: int) ->
 
         if order["amount_cents"] - order["paid_cents"] > 0:
             conn.execute("ROLLBACK")
+            # 曾结清却再次未结清，只能是收款被冲正所致：拒绝原因与“从未结清”可区分
+            if order["ever_settled"] == 1:
+                raise OrderPaymentReversed("order payment reversed")
             raise OrderNotSettled("order is not settled")
 
         if order["refunded_cents"] != 0:

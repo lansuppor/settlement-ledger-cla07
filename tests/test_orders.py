@@ -29,5 +29,5 @@ def test_cross_tenant_read_is_not_found() -> None:
 def test_payment_cannot_exceed_outstanding() -> None:
     body = {"tenant": "t1", "order_id": "o4", "amount_cents": 300, "currency": "CNY"}
     client.post("/orders", json=body)
-    assert client.post("/orders/o4/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"}).status_code == 200
+    assert client.post("/orders/o4/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"}).status_code == 201
     assert client.post("/orders/o4/payments", json={"amount_cents": 500}, headers={"X-Tenant": "t1"}).status_code == 409
