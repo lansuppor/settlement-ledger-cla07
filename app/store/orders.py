@@ -1,4 +1,6 @@
 import sqlite3
+from datetime import datetime
+from app.rules import order_rules
 from app.store.db import connect
 
 # 状态口径：已收金额达到订单金额为已结清，否则为未收清（含未登记收款）。
@@ -40,7 +42,7 @@ def _next_flow_seq(conn: sqlite3.Connection, tenant: str, order_id: str) -> int:
     ).fetchone()
     return int(row["next_seq"])
 
-def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
+def add_payment(tenant: str, order_id: str, amount_cents: int, occurred_at: str | None = None) -> dict | None:
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -59,14 +61,17 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
             (amount_cents, amount_cents, tenant, order_id),
         )
         # 收款生效后在同一事务内追加流水；失败路径已回滚，不会留下流水。
+        # 业务发生时间由调用方提供（已校验），未提供时按当前时间记账。
+        occurred = occurred_at or order_rules.now_business_time()
         paid_after = row["paid_cents"] + amount_cents
         seq = _next_flow_seq(conn, tenant, order_id)
         conn.execute(
             "INSERT INTO order_flow(tenant, order_id, seq, entry_id, entry_type, amount_cents,"
-            " paid_cents, outstanding_cents, status, reversal_id) VALUES(?,?,?,?,?,?,?,?,?,NULL)",
+            " paid_cents, outstanding_cents, status, reversal_id, occurred_at) VALUES(?,?,?,?,?,?,?,?,?,NULL,?)",
             (
                 tenant, order_id, seq, f"pay-{seq}", "payment", amount_cents,
                 paid_after, row["amount_cents"] - paid_after, _settled(paid_after, row["amount_cents"]),
+                occurred,
             ),
         )
         conn.execute("COMMIT")
@@ -75,7 +80,7 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
     return get(tenant, order_id)
 
 def reverse_payment(
-    tenant: str, order_id: str, reversal_id: str, amount_cents: int
+    tenant: str, order_id: str, reversal_id: str, amount_cents: int, occurred_at: str | None = None
 ) -> tuple[dict | None, str]:
     """登记一次收款冲正。
 
@@ -118,15 +123,17 @@ def reverse_payment(
             (amount_cents, amount_cents, tenant, order_id),
         )
         # 冲正生效后在同一事务内追加流水，并以 reversal_id 关联当次冲正。
+        # 业务发生时间由调用方提供（已校验），未提供时按当前时间记账。
+        occurred = occurred_at or order_rules.now_business_time()
         paid_after = row["paid_cents"] - amount_cents
         seq = _next_flow_seq(conn, tenant, order_id)
         conn.execute(
             "INSERT INTO order_flow(tenant, order_id, seq, entry_id, entry_type, amount_cents,"
-            " paid_cents, outstanding_cents, status, reversal_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            " paid_cents, outstanding_cents, status, reversal_id, occurred_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (
                 tenant, order_id, seq, f"rev-{seq}", "reversal", amount_cents,
                 paid_after, row["amount_cents"] - paid_after, _settled(paid_after, row["amount_cents"]),
-                reversal_id,
+                reversal_id, occurred,
             ),
         )
         conn.execute("COMMIT")
@@ -149,10 +156,29 @@ def list_flow(tenant: str, order_id: str) -> list[dict] | None:
         if owned is None:
             return None
         rows = conn.execute(
-            "SELECT seq, entry_id, entry_type, amount_cents, paid_cents, outstanding_cents, status, reversal_id"
+            "SELECT seq, entry_id, entry_type, amount_cents, paid_cents, outstanding_cents, status, reversal_id, occurred_at"
             " FROM order_flow WHERE tenant=? AND order_id=? ORDER BY seq ASC",
             (tenant, order_id),
         ).fetchall()
     finally:
         conn.close()
     return [dict(row) for row in rows]
+
+def list_flow_range(tenant: str, order_id: str, start: datetime, end: datetime) -> list[dict] | None:
+    """按生效先后返回该订单在 [start, end]（含端点，按业务发生时间）内生效的收款与冲正流水。
+
+    订单不存在或属于其他租户时返回 None（调用方按 404 处理，不泄漏对象是否存在）。
+    各条流水内容与清单查询完全一致；不同偏移的时区按同一时刻比较，不做字符串比较。
+    """
+    flow = list_flow(tenant, order_id)
+    if flow is None:
+        return None
+    result = []
+    for entry in flow:
+        try:
+            occurred = order_rules.parse_business_time(entry["occurred_at"])
+        except ValueError:
+            continue  # 升级前遗留的流水没有业务发生时间，无法归入任何区间
+        if start <= occurred <= end:
+            result.append(entry)
+    return result

@@ -1,4 +1,4 @@
-import os, tempfile
+import os, re, tempfile
 os.environ.setdefault("APP_DB", os.path.join(tempfile.mkdtemp(), "test.sqlite"))
 from fastapi.testclient import TestClient
 from app.entry import app
@@ -203,4 +203,118 @@ def test_flow_survives_restart_and_keeps_append_order() -> None:
     assert entries[2]["entry_id"] == "pay-3"
     assert (entries[2]["paid_cents"], entries[2]["outstanding_cents"], entries[2]["status"]) == (260, 240, "accepted")
     assert entries[0]["amount_cents"] == 100 and entries[1]["reversal_id"] == "frv5"
+
+_OCCURRED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
+
+def test_flow_entries_carry_business_time_defaulted_by_server() -> None:
+    _new_order("t0", 500)
+    client.post("/orders/t0/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    client.post("/orders/t0/reversals", json={"reversal_id": "trv0", "amount_cents": 40}, headers={"X-Tenant": "t1"})
+    entries = _flow("t0").json()["entries"]
+    assert len(entries) == 2
+    for entry in entries:
+        assert _OCCURRED_AT.match(entry["occurred_at"]), entry["occurred_at"]
+
+def test_flow_entries_use_caller_provided_business_time() -> None:
+    _new_order("t1x", 500)
+    client.post("/orders/t1x/payments", json={"amount_cents": 100, "occurred_at": "2026-01-05T10:00:00+08:00"}, headers={"X-Tenant": "t1"})
+    client.post("/orders/t1x/reversals", json={"reversal_id": "trv1", "amount_cents": 40, "occurred_at": "2026-03-01T12:30:00+08:00"}, headers={"X-Tenant": "t1"})
+    entries = _flow("t1x").json()["entries"]
+    assert [e["occurred_at"] for e in entries] == ["2026-01-05T10:00:00+08:00", "2026-03-01T12:30:00+08:00"]
+
+def test_invalid_business_time_is_rejected_without_side_effects() -> None:
+    _new_order("t2x", 500)
+    for bad in ["2026-01-05", "2026-01-05 10:00:00", "2026-01-05T10:00+08:00", "not-a-time", "2026-13-01T10:00:00+08:00"]:
+        assert client.post("/orders/t2x/payments", json={"amount_cents": 100, "occurred_at": bad}, headers={"X-Tenant": "t1"}).status_code == 400
+        assert client.post("/orders/t2x/reversals", json={"reversal_id": "trv2", "amount_cents": 10, "occurred_at": bad}, headers={"X-Tenant": "t1"}).status_code == 400
+    # 被拒绝的请求不产生流水、不改变账务，也不占用冲正标识
+    assert _flow("t2x").json()["entries"] == []
+    assert client.get("/orders/t2x", headers={"X-Tenant": "t1"}).json()["paid_cents"] == 0
+    client.post("/orders/t2x/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    assert client.post("/orders/t2x/reversals", json={"reversal_id": "trv2", "amount_cents": 10}, headers={"X-Tenant": "t1"}).status_code == 200
+
+def _flow_range(order_id: str, start=None, end=None, tenant: str = "t1"):
+    params = {}
+    if start is not None:
+        params["start"] = start
+    if end is not None:
+        params["end"] = end
+    return client.get(f"/orders/{order_id}/flow/range", params=params, headers={"X-Tenant": tenant})
+
+def _range_order(order_id: str) -> None:
+    _new_order(order_id, 1000)
+    client.post(f"/orders/{order_id}/payments", json={"amount_cents": 200, "occurred_at": "2026-01-10T09:00:00+08:00"}, headers={"X-Tenant": "t1"})
+    client.post(f"/orders/{order_id}/payments", json={"amount_cents": 300, "occurred_at": "2026-02-10T09:00:00+08:00"}, headers={"X-Tenant": "t1"})
+    client.post(f"/orders/{order_id}/reversals", json={"reversal_id": f"rv-{order_id}", "amount_cents": 100, "occurred_at": "2026-03-10T09:00:00+08:00"}, headers={"X-Tenant": "t1"})
+
+def test_flow_range_returns_entries_within_bounds_in_order() -> None:
+    _range_order("t3a")
+    resp = _flow_range("t3a", "2026-02-01T00:00:00+08:00", "2026-03-01T00:00:00+08:00")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["order_id"] == "t3a"
+    entries = body["entries"]
+    assert [(e["seq"], e["entry_type"], e["amount_cents"]) for e in entries] == [(2, "payment", 300)]
+    # 各条流水内容与清单返回完全一致
+    full = _flow("t3a").json()["entries"]
+    assert entries == [full[1]]
+
+def test_flow_range_bounds_are_inclusive_and_cover_all_entries() -> None:
+    _range_order("t3b")
+    entries = _flow_range("t3b", "2026-01-10T09:00:00+08:00", "2026-03-10T09:00:00+08:00").json()["entries"]
+    assert [e["seq"] for e in entries] == [1, 2, 3]
+    assert [e["occurred_at"] for e in entries] == [
+        "2026-01-10T09:00:00+08:00", "2026-02-10T09:00:00+08:00", "2026-03-10T09:00:00+08:00",
+    ]
+
+def test_flow_range_empty_when_nothing_in_window() -> None:
+    _range_order("t3c")
+    resp = _flow_range("t3c", "2026-06-01T00:00:00+08:00", "2026-07-01T00:00:00+08:00")
+    assert resp.status_code == 200 and resp.json()["entries"] == []
+
+def test_flow_range_compares_instants_across_offsets() -> None:
+    _range_order("t3d")
+    # 2026-02-10T09:00:00+08:00 即 2026-02-10T01:00:00Z，落在以 UTC 表示的区间内
+    entries = _flow_range("t3d", "2026-02-10T00:00:00+00:00", "2026-02-10T02:00:00+00:00").json()["entries"]
+    assert [e["seq"] for e in entries] == [2]
+
+def test_flow_range_rejects_invalid_params_before_reading() -> None:
+    _range_order("t3e")
+    assert _flow_range("t3e").status_code == 400  # 缺少起点与终点
+    assert _flow_range("t3e", start="2026-01-01T00:00:00+08:00").status_code == 400  # 缺少终点
+    assert _flow_range("t3e", end="2026-01-01T00:00:00+08:00").status_code == 400  # 缺少起点
+    assert _flow_range("t3e", "bad", "2026-01-01T00:00:00+08:00").status_code == 400  # 起点非法
+    assert _flow_range("t3e", "2026-01-01T00:00:00+08:00", "2026-01-01").status_code == 400  # 终点非法
+    assert _flow_range("t3e", "2026-05-01T00:00:00+08:00", "2026-01-01T00:00:00+08:00").status_code == 400  # 起点晚于终点
+
+def test_flow_range_missing_or_foreign_order_is_not_found() -> None:
+    _range_order("t3f")
+    assert _flow_range("nope", "2026-01-01T00:00:00+08:00", "2026-12-01T00:00:00+08:00").status_code == 404
+    assert _flow_range("t3f", "2026-01-01T00:00:00+08:00", "2026-12-01T00:00:00+08:00", tenant="t2").status_code == 404
+    assert client.get("/orders/t3f/flow/range", params={"start": "2026-01-01T00:00:00+08:00", "end": "2026-12-01T00:00:00+08:00"}).status_code == 400
+
+def test_business_time_survives_restart() -> None:
+    from app.store.db import connect
+    _new_order("t4x", 500)
+    client.post("/orders/t4x/payments", json={"amount_cents": 100, "occurred_at": "2026-01-05T10:00:00+08:00"}, headers={"X-Tenant": "t1"})
+    # 以全新连接模拟服务重启：业务发生时间保持不变
+    conn = connect()
+    try:
+        row = conn.execute("SELECT occurred_at FROM order_flow WHERE tenant='t1' AND order_id='t4x'").fetchone()
+        assert row["occurred_at"] == "2026-01-05T10:00:00+08:00"
+    finally:
+        conn.close()
+    entries = _flow("t4x").json()["entries"]
+    assert entries[0]["occurred_at"] == "2026-01-05T10:00:00+08:00"
+
+def test_duplicate_reversal_does_not_add_flow_entry_or_change_time() -> None:
+    _new_order("t5x", 500)
+    client.post("/orders/t5x/payments", json={"amount_cents": 500}, headers={"X-Tenant": "t1"})
+    payload = {"reversal_id": "trv5", "amount_cents": 100, "occurred_at": "2026-02-01T08:00:00+08:00"}
+    first = client.post("/orders/t5x/reversals", json=payload, headers={"X-Tenant": "t1"})
+    second = client.post("/orders/t5x/reversals", json=payload, headers={"X-Tenant": "t1"})
+    assert first.status_code == 200 and first.json() == second.json()
+    entries = _flow("t5x").json()["entries"]
+    assert [e["entry_type"] for e in entries] == ["payment", "reversal"]
+    assert entries[1]["occurred_at"] == "2026-02-01T08:00:00+08:00"
 

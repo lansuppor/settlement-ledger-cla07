@@ -16,10 +16,21 @@ class OrderIn(BaseModel):
 
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
+    occurred_at: str | None = None
 
 class ReversalIn(BaseModel):
     reversal_id: str = Field(min_length=1)
     amount_cents: int = Field(gt=0)
+    occurred_at: str | None = None
+
+def _business_time(value: str | None) -> str | None:
+    """校验调用方提供的业务发生时间；未提供时返回 None（由服务按当前时间记账）。"""
+    if value is None:
+        return None
+    try:
+        return order_rules.format_business_time(order_rules.parse_business_time(value))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
 
 @app.get("/health")
 def health() -> dict:
@@ -56,9 +67,9 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
     if not x_tenant:
         raise HTTPException(status_code=400, detail="tenant header is required")
     try:
-        order = orders.add_payment(x_tenant, order_id, body.amount_cents)
+        order = orders.add_payment(x_tenant, order_id, body.amount_cents, _business_time(body.occurred_at))
     except ValueError as error:
-        raise HTTPException(status_code=409, detail=str(error))
+        raise HTTPException(status_code=409, detail=str(error)) from None
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
@@ -67,7 +78,9 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
 def reverse_payment(order_id: str, body: ReversalIn, x_tenant: str = Header(default="")) -> dict:
     if not x_tenant:
         raise HTTPException(status_code=400, detail="tenant header is required")
-    order, result = orders.reverse_payment(x_tenant, order_id, body.reversal_id, body.amount_cents)
+    order, result = orders.reverse_payment(
+        x_tenant, order_id, body.reversal_id, body.amount_cents, _business_time(body.occurred_at)
+    )
     if result == "not_found":
         raise HTTPException(status_code=404, detail="order not found")
     if result == "conflict":
@@ -79,6 +92,30 @@ def read_order_flow(order_id: str, x_tenant: str = Header(default="")) -> dict:
     if not x_tenant:
         raise HTTPException(status_code=400, detail="tenant header is required")
     flow = orders.list_flow(x_tenant, order_id)
+    if flow is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"order_id": order_id, "entries": flow}
+
+@app.get("/orders/{order_id}/flow/range")
+def read_order_flow_range(
+    order_id: str,
+    start: str | None = None,
+    end: str | None = None,
+    x_tenant: str = Header(default=""),
+) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    # 先校验时间范围，无效时不读取任何数据。
+    if start is None or end is None:
+        raise HTTPException(status_code=400, detail="start and end query parameters are required")
+    try:
+        start_at = order_rules.parse_business_time(start)
+        end_at = order_rules.parse_business_time(end)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    if start_at > end_at:
+        raise HTTPException(status_code=400, detail="start must not be later than end")
+    flow = orders.list_flow_range(x_tenant, order_id, start_at, end_at)
     if flow is None:
         raise HTTPException(status_code=404, detail="order not found")
     return {"order_id": order_id, "entries": flow}
