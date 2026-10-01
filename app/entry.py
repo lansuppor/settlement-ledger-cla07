@@ -17,6 +17,10 @@ class OrderIn(BaseModel):
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
 
+class ReversalIn(BaseModel):
+    reversal_id: str = Field(min_length=1)
+    amount_cents: int = Field(gt=0)
+
 @app.get("/health")
 def health() -> dict:
     conn = connect()
@@ -57,6 +61,19 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
         raise HTTPException(status_code=409, detail=str(error))
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
+    return order
+
+@app.post("/orders/{order_id}/reversals", status_code=200)
+def reverse_payment(order_id: str, body: ReversalIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    result, order = orders.reverse_payment(x_tenant, order_id, body.reversal_id, body.amount_cents)
+    if result == "not_found":
+        raise HTTPException(status_code=404, detail="order not found")
+    if result == "exceeds":
+        raise HTTPException(status_code=409, detail="reversal exceeds paid amount")
+    if result == "mismatch":
+        raise HTTPException(status_code=409, detail="reversal id reused with different content")
     return order
 
 def main() -> None:
