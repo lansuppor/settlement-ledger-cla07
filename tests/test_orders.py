@@ -114,3 +114,93 @@ def test_reversal_survives_restart() -> None:
         conn.close()
     assert client.post("/orders/r9/reversals", json={"reversal_id": "rv9", "amount_cents": 250}, headers={"X-Tenant": "t1"}).json()["paid_cents"] == 250
 
+def _flow(order_id: str, tenant: str = "t1"):
+    return client.get(f"/orders/{order_id}/flow", headers={"X-Tenant": tenant})
+
+def test_flow_empty_for_new_order() -> None:
+    _new_order("f0", 500)
+    resp = _flow("f0")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["order_id"] == "f0" and body["entries"] == []
+
+def test_flow_records_payments_and_reversals_in_order_with_snapshots() -> None:
+    _new_order("f1", 500)
+    client.post("/orders/f1/payments", json={"amount_cents": 200}, headers={"X-Tenant": "t1"})
+    client.post("/orders/f1/payments", json={"amount_cents": 300}, headers={"X-Tenant": "t1"})
+    client.post("/orders/f1/reversals", json={"reversal_id": "frv1", "amount_cents": 150}, headers={"X-Tenant": "t1"})
+    entries = _flow("f1").json()["entries"]
+    assert [e["seq"] for e in entries] == [1, 2, 3]
+    assert [e["entry_type"] for e in entries] == ["payment", "payment", "reversal"]
+    assert [e["amount_cents"] for e in entries] == [200, 300, 150]
+    # 同类型多次操作以订单内唯一的流水标识区分
+    assert [e["entry_id"] for e in entries] == ["pay-1", "pay-2", "rev-3"]
+    # 每条流水保留本次操作后的账务快照
+    assert (entries[0]["paid_cents"], entries[0]["outstanding_cents"], entries[0]["status"]) == (200, 300, "accepted")
+    assert (entries[1]["paid_cents"], entries[1]["outstanding_cents"], entries[1]["status"]) == (500, 0, "settled")
+    assert (entries[2]["paid_cents"], entries[2]["outstanding_cents"], entries[2]["status"]) == (350, 150, "accepted")
+    # 冲正流水关联当次冲正标识，收款流水该字段为空
+    assert entries[0]["reversal_id"] is None
+    assert entries[2]["reversal_id"] == "frv1"
+
+def test_flow_records_each_success_once_ignoring_duplicates_and_failures() -> None:
+    _new_order("f2", 500)
+    client.post("/orders/f2/payments", json={"amount_cents": 500}, headers={"X-Tenant": "t1"})
+    payload = {"reversal_id": "frv2", "amount_cents": 100}
+    first = client.post("/orders/f2/reversals", json=payload, headers={"X-Tenant": "t1"})
+    second = client.post("/orders/f2/reversals", json=payload, headers={"X-Tenant": "t1"})
+    assert first.status_code == 200 and second.status_code == 200
+    # 同标识不同金额（409）、超额冲正（409）、超额收款（409）与非法金额（422）都不产生流水
+    assert client.post("/orders/f2/reversals", json={"reversal_id": "frv2", "amount_cents": 200}, headers={"X-Tenant": "t1"}).status_code == 409
+    assert client.post("/orders/f2/reversals", json={"reversal_id": "frv2b", "amount_cents": 999}, headers={"X-Tenant": "t1"}).status_code == 409
+    assert client.post("/orders/f2/payments", json={"amount_cents": 500}, headers={"X-Tenant": "t1"}).status_code == 409
+    assert client.post("/orders/f2/payments", json={"amount_cents": 0}, headers={"X-Tenant": "t1"}).status_code == 422
+    entries = _flow("f2").json()["entries"]
+    assert [(e["entry_type"], e["amount_cents"]) for e in entries] == [("payment", 500), ("reversal", 100)]
+    assert [e["seq"] for e in entries] == [1, 2]
+    # 失败请求不改变账务
+    assert client.get("/orders/f2", headers={"X-Tenant": "t1"}).json()["paid_cents"] == 400
+
+def test_flow_query_missing_foreign_order_and_tenant_header() -> None:
+    assert _flow("does-not-exist").status_code == 404
+    _new_order("f3", 500)
+    assert _flow("f3", tenant="t2").status_code == 404
+    assert client.get("/orders/f3/flow").status_code == 400
+    assert _flow("f3").status_code == 200
+
+def test_flow_is_scoped_per_order_and_tenant() -> None:
+    _new_order("f4a", 500, tenant="t1")
+    _new_order("f4a", 500, tenant="t2")
+    client.post("/orders/f4a/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    client.post("/orders/f4a/payments", json={"amount_cents": 200}, headers={"X-Tenant": "t2"})
+    a = _flow("f4a", "t1").json()["entries"]
+    b = _flow("f4a", "t2").json()["entries"]
+    assert [(e["seq"], e["amount_cents"]) for e in a] == [(1, 100)]
+    assert [(e["seq"], e["amount_cents"]) for e in b] == [(1, 200)]
+
+def test_flow_survives_restart_and_keeps_append_order() -> None:
+    from app.store.db import connect
+    _new_order("f5", 500)
+    client.post("/orders/f5/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    client.post("/orders/f5/reversals", json={"reversal_id": "frv5", "amount_cents": 40}, headers={"X-Tenant": "t1"})
+    # 以全新连接模拟服务重启：流水仍在，顺序、金额与快照不变
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT seq, entry_type, amount_cents, paid_cents, outstanding_cents, status, reversal_id"
+            " FROM order_flow WHERE tenant='t1' AND order_id='f5' ORDER BY seq"
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [
+            (1, "payment", 100, 100, 400, "accepted", None),
+            (2, "reversal", 40, 60, 440, "accepted", "frv5"),
+        ]
+    finally:
+        conn.close()
+    # 重启后的新操作在末尾追加，不重排也不改写已有流水
+    client.post("/orders/f5/payments", json={"amount_cents": 200}, headers={"X-Tenant": "t1"})
+    entries = _flow("f5").json()["entries"]
+    assert [e["seq"] for e in entries] == [1, 2, 3]
+    assert entries[2]["entry_id"] == "pay-3"
+    assert (entries[2]["paid_cents"], entries[2]["outstanding_cents"], entries[2]["status"]) == (260, 240, "accepted")
+    assert entries[0]["amount_cents"] == 100 and entries[1]["reversal_id"] == "frv5"
+

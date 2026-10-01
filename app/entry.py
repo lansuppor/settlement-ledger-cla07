@@ -74,6 +74,15 @@ def reverse_payment(order_id: str, body: ReversalIn, x_tenant: str = Header(defa
         raise HTTPException(status_code=409, detail="reversal conflicts with current ledger state")
     return order
 
+@app.get("/orders/{order_id}/flow")
+def read_order_flow(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    flow = orders.list_flow(x_tenant, order_id)
+    if flow is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"order_id": order_id, "entries": flow}
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)
