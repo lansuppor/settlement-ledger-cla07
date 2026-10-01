@@ -1,6 +1,11 @@
-import os, tempfile
+import os
+import tempfile
+
 os.environ.setdefault("APP_DB", os.path.join(tempfile.mkdtemp(), "test.sqlite"))
+from datetime import UTC, datetime
+
 from fastapi.testclient import TestClient
+
 from app.entry import app
 from app.store.db import migrate
 
@@ -204,3 +209,262 @@ def test_flow_survives_restart_and_keeps_append_order() -> None:
     assert (entries[2]["paid_cents"], entries[2]["outstanding_cents"], entries[2]["status"]) == (260, 240, "accepted")
     assert entries[0]["amount_cents"] == 100 and entries[1]["reversal_id"] == "frv5"
 
+
+
+# ---------- 业务发生时间 ----------
+
+def test_flow_entries_carry_business_time_defaulting_to_now() -> None:
+    from datetime import timedelta
+    _new_order("bt0", 500)
+    before = datetime.now(UTC) - timedelta(seconds=1)
+    resp = client.post("/orders/bt0/payments", json={"amount_cents": 200}, headers={"X-Tenant": "t1"})
+    after = datetime.now(UTC) + timedelta(seconds=1)
+    assert resp.status_code == 200
+    entry = _flow("bt0").json()["entries"][0]
+    # 返回带时区偏移的完整日期时间（到秒）
+    bt = datetime.fromisoformat(entry["business_time"])
+    assert bt.tzinfo is not None and bt.microsecond == 0
+    assert before <= bt <= after
+
+
+def test_explicit_business_time_is_used_and_normalized_to_utc() -> None:
+    _new_order("bt1", 500)
+    # 东八区 2026-03-10 08:00:00 == UTC 2026-03-10 00:00:00
+    resp = client.post(
+        "/orders/bt1/payments",
+        json={"amount_cents": 100, "business_time": "2026-03-10T08:00:00+08:00"},
+        headers={"X-Tenant": "t1"},
+    )
+    assert resp.status_code == 200
+    entry = _flow("bt1").json()["entries"][0]
+    assert entry["business_time"] == "2026-03-10T00:00:00+00:00"
+    # 冲正同样支持显式业务发生时间，保留到秒的完整时间
+    rev = client.post(
+        "/orders/bt1/reversals",
+        json={"reversal_id": "bt1r", "amount_cents": 40, "business_time": "2026-03-15T23:59:59Z"},
+        headers={"X-Tenant": "t1"},
+    )
+    assert rev.status_code == 200
+    rev_entry = _flow("bt1").json()["entries"][1]
+    assert rev_entry["entry_type"] == "reversal"
+    assert rev_entry["business_time"] == "2026-03-15T23:59:59+00:00"
+
+
+def test_invalid_business_time_is_400_and_changes_nothing() -> None:
+    _new_order("bt2", 500)
+    bad_values = [
+        "2026-03-10",                 # 只有日期
+        "2026-03-10T08:00",           # 只到分钟
+        "2026-03-10T08:00:00",        # 缺时区偏移
+        "2026-03-10T08:00:00.5+08:00",  # 小数秒（精度超过秒）
+        "2026-02-30T08:00:00+08:00",  # 历法不存在
+        "not-a-time",
+    ]
+    for bad in bad_values:
+        resp = client.post(
+            "/orders/bt2/payments",
+            json={"amount_cents": 100, "business_time": bad},
+            headers={"X-Tenant": "t1"},
+        )
+        assert resp.status_code == 400, bad
+    # 冲正入参同样校验
+    client.post("/orders/bt2/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    resp = client.post(
+        "/orders/bt2/reversals",
+        json={"reversal_id": "bt2r", "amount_cents": 50, "business_time": "2026-03-10T08:00:00"},
+        headers={"X-Tenant": "t1"},
+    )
+    assert resp.status_code == 400
+    # 被拒绝的请求不改变账务、不产生流水
+    order = client.get("/orders/bt2", headers={"X-Tenant": "t1"}).json()
+    assert order["paid_cents"] == 100
+    assert [e["entry_type"] for e in _flow("bt2").json()["entries"]] == ["payment"]
+    # 被拒绝的冲正不占用冲正标识
+    ok = client.post(
+        "/orders/bt2/reversals",
+        json={"reversal_id": "bt2r", "amount_cents": 50, "business_time": "2026-03-10T08:00:00Z"},
+        headers={"X-Tenant": "t1"},
+    )
+    assert ok.status_code == 200
+
+
+def test_business_time_survives_restart() -> None:
+    from app.store.db import connect
+    _new_order("bt3", 500)
+    client.post(
+        "/orders/bt3/payments",
+        json={"amount_cents": 100, "business_time": "2026-04-01T12:00:00+08:00"},
+        headers={"X-Tenant": "t1"},
+    )
+    # 全新连接模拟重启：业务发生时间原样保留
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT business_time FROM order_flow WHERE tenant='t1' AND order_id='bt3' AND seq=1"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["business_time"] == "2026-04-01T04:00:00+00:00"
+    # 此后新操作继续在末尾追加，各自携带自身时间
+    client.post(
+        "/orders/bt3/payments",
+        json={"amount_cents": 200, "business_time": "2026-04-02T12:00:00+08:00"},
+        headers={"X-Tenant": "t1"},
+    )
+    entries = _flow("bt3").json()["entries"]
+    assert [e["business_time"] for e in entries] == [
+        "2026-04-01T04:00:00+00:00",
+        "2026-04-02T04:00:00+00:00",
+    ]
+
+
+# ---------- 时间范围查询 ----------
+
+def _range(order_id: str, start: str, end: str, tenant: str = "t1"):
+    return client.get(
+        f"/orders/{order_id}/flow/range",
+        params={"start": start, "end": end},
+        headers={"X-Tenant": tenant},
+    )
+
+
+def _seed_ranged_order(order_id: str = "rg1") -> None:
+    _new_order(order_id, 1000)
+    client.post(
+        f"/orders/{order_id}/payments",
+        json={"amount_cents": 100, "business_time": "2026-05-01T00:00:00Z"},
+        headers={"X-Tenant": "t1"},
+    )
+    client.post(
+        f"/orders/{order_id}/payments",
+        json={"amount_cents": 200, "business_time": "2026-05-10T12:30:45Z"},
+        headers={"X-Tenant": "t1"},
+    )
+    client.post(
+        f"/orders/{order_id}/reversals",
+        json={"reversal_id": f"{order_id}-r", "amount_cents": 50, "business_time": "2026-05-20T08:15:30+08:00"},
+        headers={"X-Tenant": "t1"},
+    )  # 冲正时间换算 UTC 为 2026-05-20T00:15:30Z
+    client.post(
+        f"/orders/{order_id}/payments",
+        json={"amount_cents": 300, "business_time": "2026-06-01T23:59:59Z"},
+        headers={"X-Tenant": "t1"},
+    )
+
+
+def test_range_query_returns_entries_within_window_by_effective_order() -> None:
+    _seed_ranged_order("rg1")
+    resp = _range("rg1", "2026-05-01T00:00:00Z", "2026-05-31T23:59:59Z")
+    assert resp.status_code == 200
+    entries = resp.json()["entries"]
+    # 区间内为前两笔收款与一笔冲正；早于起点（无）与晚于终点（6 月那笔）不混入
+    assert [e["seq"] for e in entries] == [1, 2, 3]
+    assert [e["entry_type"] for e in entries] == ["payment", "payment", "reversal"]
+    assert [e["amount_cents"] for e in entries] == [100, 200, 50]
+    # 各条内容与流水清单完全一致
+    full = {e["seq"]: e for e in _flow("rg1").json()["entries"]}
+    for entry in entries:
+        assert entry == full[entry["seq"]]
+    # 冲正按其自身业务时间（带偏移换算后）落入区间
+    assert entries[2]["business_time"] == "2026-05-20T00:15:30+00:00"
+    assert entries[2]["reversal_id"] == "rg1-r"
+
+
+def test_range_query_is_inclusive_on_both_bounds() -> None:
+    _seed_ranged_order("rg2")
+    # 起点恰等于第一笔、终点恰等于最后一笔：边界流水都应返回
+    resp = _range("rg2", "2026-05-01T00:00:00Z", "2026-06-01T23:59:59Z")
+    assert [e["seq"] for e in resp.json()["entries"]] == [1, 2, 3, 4]
+    # 早于起点一秒：第一笔被排除
+    resp = _range("rg2", "2026-05-01T00:00:01Z", "2026-06-01T23:59:59Z")
+    assert [e["seq"] for e in resp.json()["entries"]] == [2, 3, 4]
+    # 晚于终点一秒：最后一笔被排除
+    resp = _range("rg2", "2026-05-01T00:00:00Z", "2026-06-01T23:59:58Z")
+    assert [e["seq"] for e in resp.json()["entries"]] == [1, 2, 3]
+    # 偏移换算后比较：以 +08:00 表达同一时刻，等价命中
+    resp = _range("rg2", "2026-05-01T08:00:00+08:00", "2026-05-01T08:00:00+08:00")
+    assert [e["seq"] for e in resp.json()["entries"]] == [1]
+
+
+def test_range_query_empty_window_and_order_without_entries() -> None:
+    _seed_ranged_order("rg3")
+    # 区间合法但无流水落入：200 与空数组（订单存在）
+    resp = _range("rg3", "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z")
+    assert resp.status_code == 200 and resp.json()["entries"] == []
+    # 尚无任何收款/冲正的订单，空结果同样为 200 空数组
+    _new_order("rg3empty", 500)
+    resp = _range("rg3empty", "2026-01-01T00:00:00Z", "2026-12-31T23:59:59Z")
+    assert resp.status_code == 200 and resp.json()["entries"] == []
+
+
+def test_range_query_requires_valid_bounds_and_distinguishes_errors() -> None:
+    _seed_ranged_order("rg4")
+    base = {"start": "2026-05-01T00:00:00Z", "end": "2026-05-31T23:59:59Z"}
+    # 缺少起点/终点
+    resp = client.get("/orders/rg4/flow/range", params={"end": base["end"]}, headers={"X-Tenant": "t1"})
+    assert resp.status_code == 400 and resp.json()["detail"] == "start is required"
+    resp = client.get("/orders/rg4/flow/range", params={"start": base["start"]}, headers={"X-Tenant": "t1"})
+    assert resp.status_code == 400 and resp.json()["detail"] == "end is required"
+    # 起点/终点非法（不同 detail，可区分）
+    resp = client.get(
+        "/orders/rg4/flow/range",
+        params={"start": "2026-05-01", "end": base["end"]},
+        headers={"X-Tenant": "t1"},
+    )
+    assert resp.status_code == 400 and resp.json()["detail"].startswith("start ")
+    resp = client.get(
+        "/orders/rg4/flow/range",
+        params={"start": base["start"], "end": "2026-05-31T23:59:59"},
+        headers={"X-Tenant": "t1"},
+    )
+    assert resp.status_code == 400 and resp.json()["detail"].startswith("end ")
+    # 起点晚于终点
+    resp = _range("rg4", "2026-05-31T23:59:59Z", "2026-05-01T00:00:00Z")
+    assert resp.status_code == 400 and resp.json()["detail"] == "start must not be later than end"
+    # 缺租户头
+    resp = client.get("/orders/rg4/flow/range", params=base)
+    assert resp.status_code == 400 and resp.json()["detail"] == "tenant header is required"
+
+
+def test_range_query_on_missing_or_foreign_order_is_not_found() -> None:
+    params = {"start": "2026-01-01T00:00:00Z", "end": "2026-12-31T23:59:59Z"}
+    # 订单不存在：参数全部合法后才读数据，返回 404
+    resp = client.get("/orders/rg-nope/flow/range", params=params, headers={"X-Tenant": "t1"})
+    assert resp.status_code == 404
+    # 跨租户：同样按不存在处理，不泄漏对象是否存在
+    _seed_ranged_order("rg5")
+    resp = client.get("/orders/rg5/flow/range", params=params, headers={"X-Tenant": "t2"})
+    assert resp.status_code == 404
+    # 参数非法时不读任何数据：即使订单不存在也返回参数错误而非 404
+    resp = client.get(
+        "/orders/rg-nope/flow/range",
+        params={"start": "bad", "end": params["end"]},
+        headers={"X-Tenant": "t1"},
+    )
+    assert resp.status_code == 400
+    resp = client.get(
+        "/orders/rg5/flow/range",
+        params={"start": "2026-12-31T00:00:00Z", "end": "2026-01-01T00:00:00Z"},  # 起点晚于终点
+        headers={"X-Tenant": "t2"},
+    )
+    assert resp.status_code == 400
+
+
+def test_range_query_is_scoped_per_tenant_and_order() -> None:
+    _new_order("rg6", 500, tenant="t1")
+    _new_order("rg6", 500, tenant="t2")
+    client.post(
+        "/orders/rg6/payments",
+        json={"amount_cents": 100, "business_time": "2026-05-01T00:00:00Z"},
+        headers={"X-Tenant": "t1"},
+    )
+    client.post(
+        "/orders/rg6/payments",
+        json={"amount_cents": 200, "business_time": "2026-05-02T00:00:00Z"},
+        headers={"X-Tenant": "t2"},
+    )
+    params = {"start": "2026-01-01T00:00:00Z", "end": "2026-12-31T23:59:59Z"}
+    a = client.get("/orders/rg6/flow/range", params=params, headers={"X-Tenant": "t1"}).json()["entries"]
+    b = client.get("/orders/rg6/flow/range", params=params, headers={"X-Tenant": "t2"}).json()["entries"]
+    assert [(e["seq"], e["amount_cents"]) for e in a] == [(1, 100)]
+    assert [(e["seq"], e["amount_cents"]) for e in b] == [(1, 200)]

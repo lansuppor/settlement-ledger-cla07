@@ -1,4 +1,7 @@
 import sqlite3
+from datetime import UTC, datetime
+
+from app.rules.time_rules import to_storage
 from app.store.db import connect
 
 # 状态口径：已收金额达到订单金额为已结清，否则为未收清（含未登记收款）。
@@ -40,7 +43,12 @@ def _next_flow_seq(conn: sqlite3.Connection, tenant: str, order_id: str) -> int:
     ).fetchone()
     return int(row["next_seq"])
 
-def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
+def add_payment(
+    tenant: str, order_id: str, amount_cents: int, business_time: datetime | None = None
+) -> dict | None:
+    if business_time is None:
+        business_time = datetime.now(UTC)
+    business_time = business_time.astimezone(UTC)
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -63,10 +71,12 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
         seq = _next_flow_seq(conn, tenant, order_id)
         conn.execute(
             "INSERT INTO order_flow(tenant, order_id, seq, entry_id, entry_type, amount_cents,"
-            " paid_cents, outstanding_cents, status, reversal_id) VALUES(?,?,?,?,?,?,?,?,?,NULL)",
+            " paid_cents, outstanding_cents, status, reversal_id, business_time)"
+            " VALUES(?,?,?,?,?,?,?,?,?,NULL,?)",
             (
                 tenant, order_id, seq, f"pay-{seq}", "payment", amount_cents,
                 paid_after, row["amount_cents"] - paid_after, _settled(paid_after, row["amount_cents"]),
+                to_storage(business_time),
             ),
         )
         conn.execute("COMMIT")
@@ -75,7 +85,8 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
     return get(tenant, order_id)
 
 def reverse_payment(
-    tenant: str, order_id: str, reversal_id: str, amount_cents: int
+    tenant: str, order_id: str, reversal_id: str, amount_cents: int,
+    business_time: datetime | None = None,
 ) -> tuple[dict | None, str]:
     """登记一次收款冲正。
 
@@ -87,6 +98,9 @@ def reverse_payment(
     所有路径在单个事务内完成，冲突时不改变任何账务；仅 applied 在末尾追加一条冲正流水，
     重复提交与被拒绝的请求不产生新流水。
     """
+    if business_time is None:
+        business_time = datetime.now(UTC)
+    business_time = business_time.astimezone(UTC)
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -122,11 +136,12 @@ def reverse_payment(
         seq = _next_flow_seq(conn, tenant, order_id)
         conn.execute(
             "INSERT INTO order_flow(tenant, order_id, seq, entry_id, entry_type, amount_cents,"
-            " paid_cents, outstanding_cents, status, reversal_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            " paid_cents, outstanding_cents, status, reversal_id, business_time)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (
                 tenant, order_id, seq, f"rev-{seq}", "reversal", amount_cents,
                 paid_after, row["amount_cents"] - paid_after, _settled(paid_after, row["amount_cents"]),
-                reversal_id,
+                reversal_id, to_storage(business_time),
             ),
         )
         conn.execute("COMMIT")
@@ -149,9 +164,40 @@ def list_flow(tenant: str, order_id: str) -> list[dict] | None:
         if owned is None:
             return None
         rows = conn.execute(
-            "SELECT seq, entry_id, entry_type, amount_cents, paid_cents, outstanding_cents, status, reversal_id"
-            " FROM order_flow WHERE tenant=? AND order_id=? ORDER BY seq ASC",
+            "SELECT seq, entry_id, entry_type, amount_cents, paid_cents, outstanding_cents, status,"
+            " reversal_id, business_time FROM order_flow WHERE tenant=? AND order_id=? ORDER BY seq ASC",
             (tenant, order_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def list_flow_range(
+    tenant: str, order_id: str, start: datetime, end: datetime
+) -> list[dict] | None:
+    """按业务发生时间范围返回该订单在本租户下生效的收款与冲正。
+
+    订单不存在或属于其他租户时返回 None（调用方按 404 处理，不泄漏对象是否存在）。
+    闭区间以 business_time（UTC 文本）为准，早于起点或晚于终点的流水不返回；
+    结果按生效先后（seq 升序）排列，各条内容与 list_flow 完全一致。
+    调用方负责先校验起点、终点合法且起点不晚于终点；本函数只读数据。
+    """
+    start = start.astimezone(UTC)
+    end = end.astimezone(UTC)
+    conn = connect()
+    try:
+        owned = conn.execute(
+            "SELECT 1 FROM orders WHERE tenant=? AND order_id=?",
+            (tenant, order_id),
+        ).fetchone()
+        if owned is None:
+            return None
+        rows = conn.execute(
+            "SELECT seq, entry_id, entry_type, amount_cents, paid_cents, outstanding_cents, status,"
+            " reversal_id, business_time FROM order_flow"
+            " WHERE tenant=? AND order_id=? AND business_time >= ? AND business_time <= ? ORDER BY seq ASC",
+            (tenant, order_id, to_storage(start), to_storage(end)),
         ).fetchall()
     finally:
         conn.close()
