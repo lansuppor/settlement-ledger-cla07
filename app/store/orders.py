@@ -1,5 +1,5 @@
-import sqlite3
 from app.store.db import connect
+
 
 def insert(tenant: str, order_id: str, amount_cents: int, currency: str) -> None:
     conn = connect()
@@ -15,15 +15,17 @@ def get(tenant: str, order_id: str) -> dict | None:
     conn = connect()
     try:
         row = conn.execute(
-            "SELECT tenant, order_id, amount_cents, paid_cents, currency, status FROM orders WHERE tenant=? AND order_id=?",
+            "SELECT tenant, order_id, amount_cents, paid_cents, refunded_cents, currency, status FROM orders WHERE tenant=? AND order_id=?",
             (tenant, order_id),
         ).fetchone()
     finally:
         conn.close()
     if row is None:
         return None
-    outstanding = row["amount_cents"] - row["paid_cents"]
-    return {**dict(row), "outstanding_cents": outstanding}
+    data = dict(row)
+    data["outstanding_cents"] = data["amount_cents"] - data["paid_cents"]
+    data["refundable_cents"] = data["amount_cents"] - data["refunded_cents"]
+    return data
 
 def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
     conn = connect()

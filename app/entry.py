@@ -1,10 +1,12 @@
 import argparse
-from fastapi import FastAPI, Header, HTTPException, Response
+
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from app.config import tenant_header
-from app.store import orders
-from app.store.db import connect, migrate
+
 from app.rules import order_rules
+from app.store import orders, refunds
+from app.store.db import connect, migrate
+from app.store.refunds import RefundRuleError
 
 app = FastAPI(title="settlement-ledger")
 
@@ -15,6 +17,11 @@ class OrderIn(BaseModel):
     currency: str = Field(min_length=3, max_length=3)
 
 class PaymentIn(BaseModel):
+    amount_cents: int = Field(gt=0)
+
+class RefundIn(BaseModel):
+    refund_id: str = Field(min_length=1)
+    order_id: str = Field(min_length=1)
     amount_cents: int = Field(gt=0)
 
 @app.get("/health")
@@ -58,6 +65,37 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.post("/refunds", status_code=201)
+def accept_refund(body: RefundIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        return refunds.accept(x_tenant, body.refund_id, body.order_id, body.amount_cents)
+    except RefundRuleError as error:
+        status = 404 if str(error) == refunds.ORDER_NOT_FOUND else 409
+        raise HTTPException(status_code=status, detail=str(error))
+
+@app.get("/refunds/{refund_id}")
+def read_refund(refund_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    refund = refunds.get(x_tenant, refund_id)
+    if refund is None:
+        raise HTTPException(status_code=404, detail="refund not found")
+    return refund
+
+@app.post("/refunds/{refund_id}/reversal", status_code=200)
+def reverse_refund(refund_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        refund = refunds.reverse(x_tenant, refund_id)
+    except RefundRuleError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if refund is None:
+        raise HTTPException(status_code=404, detail="refund not found")
+    return refund
 
 def main() -> None:
     parser = argparse.ArgumentParser()

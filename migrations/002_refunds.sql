@@ -1,0 +1,15 @@
+ALTER TABLE orders ADD COLUMN refunded_cents INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS refunds(
+  tenant TEXT NOT NULL,
+  refund_id TEXT NOT NULL,
+  order_id TEXT NOT NULL,
+  amount_cents INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  reversed_at TEXT,
+  PRIMARY KEY(tenant, refund_id),
+  FOREIGN KEY(tenant, order_id) REFERENCES orders(tenant, order_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_refunds_order ON refunds(tenant, order_id);
