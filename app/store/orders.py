@@ -48,6 +48,20 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
             f"UPDATE orders SET paid_cents = paid_cents + ?, status = {_STATUS_ON_ADD} WHERE tenant=? AND order_id=?",
             (amount_cents, amount_cents, tenant, order_id),
         )
+        paid_after = row["paid_cents"] + amount_cents
+        conn.execute(
+            "INSERT INTO payment_ledger(tenant, order_id, kind, amount_cents, paid_cents, outstanding_cents, status, reversal_id)"
+            " VALUES(?,?,?,?,?,?,?,NULL)",
+            (
+                tenant,
+                order_id,
+                "payment",
+                amount_cents,
+                paid_after,
+                row["amount_cents"] - paid_after,
+                "settled" if paid_after >= row["amount_cents"] else "accepted",
+            ),
+        )
         conn.execute("COMMIT")
     finally:
         conn.close()
@@ -95,7 +109,41 @@ def reverse_payment(
             f"UPDATE orders SET paid_cents = paid_cents - ?, status = {_STATUS_ON_REVERSE} WHERE tenant=? AND order_id=?",
             (amount_cents, amount_cents, tenant, order_id),
         )
+        paid_after = row["paid_cents"] - amount_cents
+        conn.execute(
+            "INSERT INTO payment_ledger(tenant, order_id, kind, amount_cents, paid_cents, outstanding_cents, status, reversal_id)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (
+                tenant,
+                order_id,
+                "reversal",
+                amount_cents,
+                paid_after,
+                row["amount_cents"] - paid_after,
+                "settled" if paid_after >= row["amount_cents"] else "accepted",
+                reversal_id,
+            ),
+        )
         conn.execute("COMMIT")
     finally:
         conn.close()
     return get(tenant, order_id), "applied"
+
+def list_ledger(tenant: str, order_id: str) -> list[dict] | None:
+    """按生效先后返回订单的收款/冲正流水；订单不存在（含跨租户）时返回 None。"""
+    conn = connect()
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM orders WHERE tenant=? AND order_id=?",
+            (tenant, order_id),
+        ).fetchone()
+        if exists is None:
+            return None
+        rows = conn.execute(
+            "SELECT entry_id, kind, amount_cents, paid_cents, outstanding_cents, status, reversal_id"
+            " FROM payment_ledger WHERE tenant=? AND order_id=? ORDER BY entry_id",
+            (tenant, order_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]

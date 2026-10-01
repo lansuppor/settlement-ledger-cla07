@@ -114,3 +114,61 @@ def test_reversal_survives_restart() -> None:
         conn.close()
     assert client.post("/orders/r9/reversals", json={"reversal_id": "rv9", "amount_cents": 250}, headers={"X-Tenant": "t1"}).json()["paid_cents"] == 250
 
+def test_ledger_records_payments_and_reversals_in_order() -> None:
+    _new_order("L1", 500)
+    client.post("/orders/L1/payments", json={"amount_cents": 500}, headers={"X-Tenant": "t1"})
+    client.post("/orders/L1/reversals", json={"reversal_id": "rL1", "amount_cents": 200}, headers={"X-Tenant": "t1"})
+    client.post("/orders/L1/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    resp = client.get("/orders/L1/ledger", headers={"X-Tenant": "t1"})
+    assert resp.status_code == 200
+    entries = resp.json()["entries"]
+    assert [e["kind"] for e in entries] == ["payment", "reversal", "payment"]
+    assert [e["amount_cents"] for e in entries] == [500, 200, 100]
+    assert [e["paid_cents"] for e in entries] == [500, 300, 400]
+    assert [e["outstanding_cents"] for e in entries] == [0, 200, 100]
+    assert [e["status"] for e in entries] == ["settled", "accepted", "accepted"]
+    assert entries[1]["reversal_id"] == "rL1"
+    assert entries[0]["reversal_id"] is None and entries[2]["reversal_id"] is None
+    # 流水标识互不相同且按生效先后递增
+    ids = [e["entry_id"] for e in entries]
+    assert len(set(ids)) == 3 and ids == sorted(ids)
+
+def test_ledger_skips_failed_and_duplicate_operations() -> None:
+    _new_order("L2", 500)
+    client.post("/orders/L2/payments", json={"amount_cents": 500}, headers={"X-Tenant": "t1"})
+    # 超额收款、超额冲正、同标识不同金额的冲正都被拒绝，不产生流水
+    assert client.post("/orders/L2/payments", json={"amount_cents": 1}, headers={"X-Tenant": "t1"}).status_code == 409
+    assert client.post("/orders/L2/reversals", json={"reversal_id": "rL2x", "amount_cents": 600}, headers={"X-Tenant": "t1"}).status_code == 409
+    assert client.post("/orders/L2/reversals", json={"reversal_id": "rL2", "amount_cents": 200}, headers={"X-Tenant": "t1"}).status_code == 200
+    assert client.post("/orders/L2/reversals", json={"reversal_id": "rL2", "amount_cents": 300}, headers={"X-Tenant": "t1"}).status_code == 409
+    # 重复提交同一冲正标识：幂等返回成功，但不新增流水
+    assert client.post("/orders/L2/reversals", json={"reversal_id": "rL2", "amount_cents": 200}, headers={"X-Tenant": "t1"}).status_code == 200
+    entries = client.get("/orders/L2/ledger", headers={"X-Tenant": "t1"}).json()["entries"]
+    assert [e["kind"] for e in entries] == ["payment", "reversal"]
+    assert entries[1]["paid_cents"] == 300
+
+def test_ledger_requires_tenant_and_hides_foreign_orders() -> None:
+    _new_order("L3", 500)
+    client.post("/orders/L3/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    assert client.get("/orders/L3/ledger").status_code == 400
+    assert client.get("/orders/nope/ledger", headers={"X-Tenant": "t1"}).status_code == 404
+    # 跨租户读取按不存在处理，不泄漏流水
+    assert client.get("/orders/L3/ledger", headers={"X-Tenant": "t2"}).status_code == 404
+
+def test_ledger_survives_restart() -> None:
+    _new_order("L4", 500)
+    client.post("/orders/L4/payments", json={"amount_cents": 500}, headers={"X-Tenant": "t1"})
+    client.post("/orders/L4/reversals", json={"reversal_id": "rL4", "amount_cents": 250}, headers={"X-Tenant": "t1"})
+    before = client.get("/orders/L4/ledger", headers={"X-Tenant": "t1"}).json()
+    # 以全新连接模拟服务重启：流水内容、顺序与账务快照保持不变
+    from app.store.db import connect
+    conn = connect()
+    conn.close()
+    after = client.get("/orders/L4/ledger", headers={"X-Tenant": "t1"}).json()
+    assert after == before
+    # 重启后新的操作继续在末尾追加，不改写已有流水
+    client.post("/orders/L4/payments", json={"amount_cents": 100}, headers={"X-Tenant": "t1"})
+    entries = client.get("/orders/L4/ledger", headers={"X-Tenant": "t1"}).json()["entries"]
+    assert entries[:2] == before["entries"]
+    assert len(entries) == 3 and entries[2]["kind"] == "payment" and entries[2]["paid_cents"] == 350
+

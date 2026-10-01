@@ -51,6 +51,15 @@ def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) ->
         raise HTTPException(status_code=404, detail="order not found")
     return order
 
+@app.get("/orders/{order_id}/ledger")
+def read_ledger(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    entries = orders.list_ledger(x_tenant, order_id)
+    if entries is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"order_id": order_id, "entries": entries}
+
 @app.post("/orders/{order_id}/payments")
 def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="")) -> dict:
     if not x_tenant:
