@@ -17,6 +17,10 @@ class OrderIn(BaseModel):
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
 
+class ReversalIn(BaseModel):
+    reversal_id: str = Field(min_length=1)
+    amount_cents: int = Field(gt=0)
+
 @app.get("/health")
 def health() -> dict:
     conn = connect()
@@ -57,6 +61,17 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
         raise HTTPException(status_code=409, detail=str(error))
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
+    return order
+
+@app.post("/orders/{order_id}/reversals")
+def reverse_payment(order_id: str, body: ReversalIn, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    order, result = orders.reverse_payment(x_tenant, order_id, body.reversal_id, body.amount_cents)
+    if result == "not_found":
+        raise HTTPException(status_code=404, detail="order not found")
+    if result == "conflict":
+        raise HTTPException(status_code=409, detail="reversal conflicts with current ledger state")
     return order
 
 def main() -> None:

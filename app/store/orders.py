@@ -1,6 +1,11 @@
 import sqlite3
 from app.store.db import connect
 
+# 状态口径：已收金额达到订单金额为已结清，否则为未收清（含未登记收款）。
+# 注意 SQLite 的 UPDATE 中对列的引用取更新前的值，故增量需显式代入。
+_STATUS_ON_ADD = "CASE WHEN paid_cents + ? >= amount_cents THEN 'settled' ELSE 'accepted' END"
+_STATUS_ON_REVERSE = "CASE WHEN paid_cents - ? >= amount_cents THEN 'settled' ELSE 'accepted' END"
+
 def insert(tenant: str, order_id: str, amount_cents: int, currency: str) -> None:
     conn = connect()
     try:
@@ -40,10 +45,57 @@ def add_payment(tenant: str, order_id: str, amount_cents: int) -> dict | None:
             conn.execute("ROLLBACK")
             raise ValueError("payment exceeds outstanding amount")
         conn.execute(
-            "UPDATE orders SET paid_cents = paid_cents + ?, status = CASE WHEN paid_cents + ? >= amount_cents THEN 'settled' ELSE 'accepted' END WHERE tenant=? AND order_id=?",
+            f"UPDATE orders SET paid_cents = paid_cents + ?, status = {_STATUS_ON_ADD} WHERE tenant=? AND order_id=?",
             (amount_cents, amount_cents, tenant, order_id),
         )
         conn.execute("COMMIT")
     finally:
         conn.close()
     return get(tenant, order_id)
+
+def reverse_payment(
+    tenant: str, order_id: str, reversal_id: str, amount_cents: int
+) -> tuple[dict | None, str]:
+    """登记一次收款冲正。
+
+    返回 (订单, 结果)：
+    - (order, "applied")：本次冲正已生效；
+    - (order, "duplicate")：冲正标识此前已成功提交，业务内容一致，按首次成功结果返回；
+    - (None, "not_found")：订单在该租户下不存在（含属于其他租户）；
+    - (None, "conflict")：冲正金额超过当前已收金额，或同一冲正标识的业务内容与首次不一致。
+    所有路径在单个事务内完成，冲突时不改变任何账务。
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        prior = conn.execute(
+            "SELECT order_id, amount_cents FROM payment_reversals WHERE tenant=? AND reversal_id=?",
+            (tenant, reversal_id),
+        ).fetchone()
+        if prior is not None:
+            conn.execute("ROLLBACK")
+            if prior["order_id"] == order_id and prior["amount_cents"] == amount_cents:
+                return get(tenant, order_id), "duplicate"
+            return None, "conflict"
+        row = conn.execute(
+            "SELECT amount_cents, paid_cents FROM orders WHERE tenant=? AND order_id=?",
+            (tenant, order_id),
+        ).fetchone()
+        if row is None:
+            conn.execute("ROLLBACK")
+            return None, "not_found"
+        if amount_cents <= 0 or amount_cents > row["paid_cents"]:
+            conn.execute("ROLLBACK")
+            return None, "conflict"
+        conn.execute(
+            "INSERT INTO payment_reversals(tenant, reversal_id, order_id, amount_cents) VALUES(?,?,?,?)",
+            (tenant, reversal_id, order_id, amount_cents),
+        )
+        conn.execute(
+            f"UPDATE orders SET paid_cents = paid_cents - ?, status = {_STATUS_ON_REVERSE} WHERE tenant=? AND order_id=?",
+            (amount_cents, amount_cents, tenant, order_id),
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    return get(tenant, order_id), "applied"
