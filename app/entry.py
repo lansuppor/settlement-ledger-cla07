@@ -4,7 +4,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.rules.time_rules import BusinessTimeError, parse_business_time
+from app.rules.time_rules import BusinessTimeError, OffsetError, parse_business_time, parse_offset
 from app.store import orders
 from app.store.db import connect, migrate
 
@@ -137,6 +137,48 @@ def read_order_flow_range(
     if flow is None:
         raise HTTPException(status_code=404, detail="order not found")
     return {"order_id": order_id, "entries": flow}
+
+@app.get("/orders/{order_id}/flow/daily-summary")
+def read_order_flow_daily_summary(
+    order_id: str,
+    x_tenant: str = Header(default=""),
+    start: str | None = Query(default=None),
+    end: str | None = Query(default=None),
+    offset: str | None = Query(default=None),
+) -> dict:
+    # 先做全部入参校验，任一不合法都在读取任何订单/流水数据之前以可区分的参数错误返回。
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    if start is None:
+        raise HTTPException(status_code=400, detail="start is required")
+    if end is None:
+        raise HTTPException(status_code=400, detail="end is required")
+    if offset is None:
+        raise HTTPException(status_code=400, detail="offset is required")
+    try:
+        start_time = parse_business_time(start)
+    except BusinessTimeError:
+        raise HTTPException(
+            status_code=400,
+            detail="start must be a complete date-time with timezone offset, precise to the second",
+        )
+    try:
+        end_time = parse_business_time(end)
+    except BusinessTimeError:
+        raise HTTPException(
+            status_code=400,
+            detail="end must be a complete date-time with timezone offset, precise to the second",
+        )
+    try:
+        zone = parse_offset(offset)
+    except OffsetError:
+        raise HTTPException(status_code=400, detail="offset must be a timezone offset like +08:00 or Z")
+    if start_time > end_time:
+        raise HTTPException(status_code=400, detail="start must not be later than end")
+    groups = orders.daily_summary(x_tenant, order_id, start_time, end_time, zone)
+    if groups is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"order_id": order_id, "offset": offset, "groups": groups}
 
 def main() -> None:
     parser = argparse.ArgumentParser()
