@@ -441,3 +441,89 @@ def list_installments(tenant: str, order_id: str) -> list[dict] | None:
     finally:
         conn.close()
     return [dict(row) for row in rows]
+
+
+def search_orders(
+    tenant: str,
+    *,
+    status: str | None = None,
+    currency: str | None = None,
+    amount_min: int | None = None,
+    amount_max: int | None = None,
+    originator: str | None = None,
+    has_installment: bool | None = None,
+    page_size: int,
+    after_order_id: str | None = None,
+) -> tuple[list[dict], bool]:
+    """当前租户内按条件检索订单账面快照，以 order_id 为稳定排序键做 keyset 分页。
+
+    返回 (本页订单, 是否还有下一页)。多条件同时给定时按同时满足（AND）处理；
+    状态按查询当下账面判定（未收为零即已结清），而非直接读 status 列，退款/冲正后
+    自然回退。多取一条用于判断是否还有下一页，调用方据此生成/清空续取标记。
+    """
+    clauses = ["o.tenant = ?"]
+    params: list = [tenant]
+    if status == "accepted":
+        # 未收金额为正：未结清
+        clauses.append("o.amount_cents - o.paid_cents > 0")
+    elif status == "settled":
+        # 未收金额为零：已结清
+        clauses.append("o.amount_cents - o.paid_cents = 0")
+    if currency is not None:
+        clauses.append("o.currency = ?")
+        params.append(currency)
+    if amount_min is not None:
+        clauses.append("o.amount_cents >= ?")
+        params.append(amount_min)
+    if amount_max is not None:
+        clauses.append("o.amount_cents <= ?")
+        params.append(amount_max)
+    if originator is not None:
+        # 发起过收款：存在该发起方的 payment 流水即命中（冲正/退款不改变“曾发起”事实）
+        clauses.append(
+            "EXISTS (SELECT 1 FROM payment_records pr "
+            "WHERE pr.tenant = o.tenant AND pr.order_id = o.order_id "
+            "AND pr.record_type = 'payment' AND pr.originator = ?)"
+        )
+        params.append(originator)
+    if has_installment is True:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM installments i WHERE i.tenant = o.tenant AND i.order_id = o.order_id)"
+        )
+    elif has_installment is False:
+        clauses.append(
+            "NOT EXISTS (SELECT 1 FROM installments i WHERE i.tenant = o.tenant AND i.order_id = o.order_id)"
+        )
+    if after_order_id is not None:
+        # 稳定续取：只取排序键严格大于上一页末尾的订单
+        clauses.append("o.order_id > ?")
+        params.append(after_order_id)
+
+    sql = (
+        "SELECT o.order_id, o.amount_cents, o.paid_cents, o.currency "
+        "FROM orders o WHERE " + " AND ".join(clauses) + " "
+        "ORDER BY o.order_id ASC LIMIT ?"
+    )
+    params.append(page_size + 1)
+    conn = connect()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+    has_more = len(rows) > page_size
+    orders_out: list[dict] = []
+    for row in rows[:page_size]:
+        outstanding = row["amount_cents"] - row["paid_cents"]
+        orders_out.append(
+            {
+                "order_id": row["order_id"],
+                "amount_cents": row["amount_cents"],
+                "paid_cents": row["paid_cents"],
+                "outstanding_cents": outstanding,
+                "currency": row["currency"],
+                # 状态按查询当下账面含义判定，不依赖可能滞后的 status 列
+                "status": "settled" if outstanding == 0 else "accepted",
+            }
+        )
+    return orders_out, has_more

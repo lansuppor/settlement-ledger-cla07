@@ -1,9 +1,9 @@
 import argparse
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.rules import order_rules
+from app.rules import order_rules, search_rules
 from app.store import imports, orders
 from app.store.db import connect, migrate
 from app.store.imports import ImportFileError
@@ -57,6 +57,51 @@ def create_order(body: OrderIn) -> dict:
             raise HTTPException(status_code=409, detail="order already accepted")
         raise
     return orders.get(body.tenant, body.order_id)
+
+@app.get("/orders")
+def search_orders(
+    x_tenant: str = Header(default=""),
+    status: str | None = Query(default=None),
+    currency: str | None = Query(default=None),
+    amount_min: str | None = Query(default=None),
+    amount_max: str | None = Query(default=None),
+    originator: str | None = Query(default=None),
+    has_installment: str | None = Query(default=None),
+    page_size: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+) -> dict:
+    """订单账面条件检索：当前租户内按条件过滤，以订单标识为稳定键分页返回账面快照。"""
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        params = search_rules.normalize_query(
+            status=status,
+            currency=currency,
+            amount_min=amount_min,
+            amount_max=amount_max,
+            originator=originator,
+            has_installment=has_installment,
+            page_size=page_size,
+        )
+        after = search_rules.decode_cursor(cursor) if cursor else None
+    except search_rules.SearchParamsError as error:
+        # 条件不合法：可区分的拒绝原因，且不改动任何数据
+        raise HTTPException(status_code=400, detail=str(error))
+
+    page, has_more = orders.search_orders(
+        x_tenant,
+        status=params["status"],
+        currency=params["currency"],
+        amount_min=params["amount_min"],
+        amount_max=params["amount_max"],
+        originator=params["originator"],
+        has_installment=params["has_installment"],
+        page_size=params["page_size"],
+        after_order_id=after,
+    )
+    # 仅在确有下一页时给出续取标记（指向本页末尾订单）；末页与无结果均为空标记
+    next_cursor = search_rules.encode_cursor(page[-1]["order_id"]) if has_more and page else ""
+    return {"orders": page, "next_cursor": next_cursor}
 
 @app.get("/orders/{order_id}")
 def read_order(order_id: str, x_tenant: str = Header(default="")) -> dict:

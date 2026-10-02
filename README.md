@@ -19,6 +19,16 @@
 
 ## 已有公开接口
 
+- `GET /orders`：订单账面条件检索与稳定分页（收款受理查询入口）。租户通过请求头 `X-Tenant` 传入，只在当前租户内生效，任何条件下都不返回其他租户订单、不泄漏对象是否存在。查询参数全部可选，条件为空时返回全部订单，多个条件同时给定时按同时满足（AND）处理：
+  - `status`：订单状态，`accepted`=未结清（未收金额为正）、`settled`=已结清（未收金额为零）；按查询当下账面判定，退款或冲正使未收转正后自然回到未结清。
+  - `currency`：按币种精确过滤（如 `CNY`）。
+  - `amount_min` / `amount_max`：按订单应收金额闭区间过滤（非负整数，下限不得大于上限）。
+  - `originator`：发起过收款的收款流水发起方标识（存在该发起方的 `payment` 流水即命中；冲正/退款不改变“曾发起”事实）。
+  - `has_installment`：是否受理过分期计划，`true` / `false`。
+  - `page_size`：单页条数，正整数，缺省 20。
+  - `cursor`：上一页响应给出的续取标记（不透明字符串，缺省取首页）。
+  - 响应 `200`：`{"orders": [...], "next_cursor": "..."}`；结果按 `order_id` 升序，每条含 `order_id`、`amount_cents`（订单金额）、`paid_cents`（已收）、`outstanding_cents`（未收）、`currency`、`status`。以订单标识为稳定排序键，翻页过程中新增或变更的单据不会造成已返回订单重复返回、也不会跳过符合条件的订单；无结果或已是末页时返回空列表与空的 `next_cursor`。
+  - 参数不合法返回 `400` 且可区分：金额下限大于上限（`amount_min must not be greater than amount_max`）、`page_size` 非正或非整数（`page_size must be a positive integer`）、续取标记无法解析（`cursor is not parseable`）、状态取值非法（`unsupported status filter`）、金额边界非非负整数、`has_installment` 非 `true/false`；任一拒绝都不改动任何数据。缺少租户头返回 `400`（`tenant header is required`）。
 - `POST /orders`：受理订单。请求字段 `tenant`、`order_id`、`amount_cents`、`currency`。成功返回 201 与订单对象；参数不合法返回 400；同一租户重复受理返回 409。
 - `GET /orders/{order_id}`：按标识读取订单。租户通过请求头 `X-Tenant` 传入；不存在返回 404；跨租户读取返回 404（不泄漏对象是否存在）。
 - `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`；超过未收金额返回 409；成功返回 200 与订单的 `paid_cents`、`outstanding_cents`，同时写入一条类型为 `payment` 的收款流水（发起方可由请求头 `X-Originator` 声明，缺省取租户标识）。
@@ -81,6 +91,16 @@ curl -s -XPOST localhost:8000/payments/import \
 
 # 凭批次标识查询逐行结论（含中断批次的已完成行）
 curl -s localhost:8000/payments/import/imp_ab12... -H 'X-Tenant: t1'
+
+# 订单账面条件检索：无条件取当前租户全部订单（首页，默认每页 20 条）
+curl -s 'localhost:8000/orders?page_size=2' -H 'X-Tenant: t1'
+
+# 多条件同时满足：未结清 + 币种 + 应收区间 + 某发起方发起过收款 + 未受理分期
+curl -s 'localhost:8000/orders?status=accepted&currency=CNY&amount_min=100&amount_max=1000&originator=alice&has_installment=false' \
+  -H 'X-Tenant: t1'
+
+# 用上一页响应中的 next_cursor 稳定续取下一页（过滤条件原样带上）
+curl -s 'localhost:8000/orders?page_size=2&cursor=<上一页的next_cursor>' -H 'X-Tenant: t1'
 ```
 
 ## 数据与配置
