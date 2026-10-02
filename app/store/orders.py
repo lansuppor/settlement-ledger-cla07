@@ -288,3 +288,59 @@ def daily_summary(
         group["last_business_time"] = to_display(group["last_business_time"], offset)
         result.append(group)
     return result
+
+
+def monthly_summary(
+    tenant: str, order_id: str, start: datetime, end: datetime, offset: timezone
+) -> list[dict] | None:
+    """按对账时区偏移对闭区间 [start, end] 内的流水按年月汇总。
+
+    订单不存在或属于其他租户时返回 None（调用方按 404 处理，不泄漏对象是否存在）。
+    每条流水按其 UTC 基准时刻换算到对账偏移后的日历日所在年月归组，恰落入一个分组；
+    无流水的月份不出现，结果按月份升序。每组给出收款合计、冲正合计、流水条数，
+    以及组内最早/最晚业务发生时间（按对账偏移写法返回，基准时刻仍是该条流水自身时刻）。
+    与按日汇总同一取数口径：同一偏移下各月分组恰为该月内各日分组的合并，不重不漏。
+    调用方负责先校验起点、终点与偏移合法且起点不晚于终点；本函数只读数据。
+    """
+    start = start.astimezone(UTC)
+    end = end.astimezone(UTC)
+    conn = connect()
+    try:
+        owned = conn.execute(
+            "SELECT 1 FROM orders WHERE tenant=? AND order_id=?",
+            (tenant, order_id),
+        ).fetchone()
+        if owned is None:
+            return None
+        rows = _flow_rows_in_range(conn, tenant, order_id, start, end)
+    finally:
+        conn.close()
+    groups: dict[str, dict] = {}
+    for row in rows:
+        instant = datetime.fromisoformat(row["business_time"]).replace(tzinfo=UTC)
+        month = instant.astimezone(offset).date().isoformat()[:7]
+        group = groups.get(month)
+        if group is None:
+            group = {
+                "month": month,
+                "payment_cents": 0,
+                "reversal_cents": 0,
+                "entry_count": 0,
+                "first_business_time": instant,
+                "last_business_time": instant,
+            }
+            groups[month] = group
+        if row["entry_type"] == "payment":
+            group["payment_cents"] += row["amount_cents"]
+        else:
+            group["reversal_cents"] += row["amount_cents"]
+        group["entry_count"] += 1
+        group["first_business_time"] = min(group["first_business_time"], instant)
+        group["last_business_time"] = max(group["last_business_time"], instant)
+    result = []
+    for month in sorted(groups):
+        group = groups[month]
+        group["first_business_time"] = to_display(group["first_business_time"], offset)
+        group["last_business_time"] = to_display(group["last_business_time"], offset)
+        result.append(group)
+    return result
