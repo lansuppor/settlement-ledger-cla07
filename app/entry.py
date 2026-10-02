@@ -48,16 +48,42 @@ def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) ->
     return order
 
 @app.post("/orders/{order_id}/payments")
-def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="")) -> dict:
+def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default=""), x_actor: str = Header(default="")) -> dict:
     if not x_tenant:
         raise HTTPException(status_code=400, detail="tenant header is required")
     try:
-        order = orders.add_payment(x_tenant, order_id, body.amount_cents)
+        order = orders.add_payment(x_tenant, order_id, body.amount_cents, x_actor or "unknown")
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error))
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.get("/orders/{order_id}/payments")
+def list_payment_flows(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    flows = orders.list_flows(x_tenant, order_id)
+    if flows is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"order_id": order_id, "flows": flows}
+
+@app.post("/orders/{order_id}/payments/{flow_id}/reversal", status_code=200)
+def reverse_payment(order_id: str, flow_id: str, x_tenant: str = Header(default=""), x_actor: str = Header(default="")) -> dict:
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    try:
+        return orders.reverse_payment(x_tenant, order_id, flow_id, x_actor or "unknown")
+    except orders.ReversalError as error:
+        # 订单/流水不存在与跨租户一律按不存在处理，不泄漏对象是否存在；重复冲正单独可区分。
+        status = {
+            "order not found": 404,
+            "payment flow not found": 404,
+            "payment already reversed": 409,
+            "reversal would produce illegal balance": 409,
+        }.get(error.reason, 409)
+        raise HTTPException(status_code=status, detail=error.reason)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
