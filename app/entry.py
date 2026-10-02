@@ -18,6 +18,15 @@ class OrderIn(BaseModel):
 
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
+    installment_id: str | None = Field(default=None, min_length=1)
+
+class InstallmentIn(BaseModel):
+    installment_id: str = Field(min_length=1)
+    amount_cents: int = Field(gt=0)
+    due_at: str = Field(min_length=1)
+
+class PlanIn(BaseModel):
+    installments: list[InstallmentIn] = Field(min_length=1)
 
 @app.get("/health")
 def health() -> dict:
@@ -55,12 +64,37 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
         raise HTTPException(status_code=400, detail="tenant header is required")
     originator = x_originator or x_tenant
     try:
-        order = orders.add_payment(x_tenant, order_id, body.amount_cents, originator)
+        order = orders.add_payment(x_tenant, order_id, body.amount_cents, originator, installment_id=body.installment_id)
     except LedgerError as error:
         raise HTTPException(status_code=409, detail=str(error))
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.post("/orders/{order_id}/installments", status_code=201)
+def register_plan(order_id: str, body: PlanIn, x_tenant: str = Header(default="")) -> dict:
+    """受理分期计划：整份校验、整份落库；同一订单只能受理一次。"""
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    items = [item.model_dump() for item in body.installments]
+    try:
+        plan = orders.register_plan(x_tenant, order_id, items)
+    except LedgerError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+    if plan is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"order_id": order_id, "installments": plan}
+
+@app.get("/orders/{order_id}/installments")
+def list_installments(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    """分期计划查询：返回各期应收、到期时间与收讫状态。"""
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    plan = orders.list_installments(x_tenant, order_id)
+    if plan is None:
+        # 订单不存在或跨租户，一律按不存在处理
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"order_id": order_id, "installments": plan}
 
 @app.get("/orders/{order_id}/payments")
 def list_payments(order_id: str, x_tenant: str = Header(default="")) -> dict:

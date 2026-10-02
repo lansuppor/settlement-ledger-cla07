@@ -8,6 +8,15 @@ from app.store.db import connect
 PAYMENT_EXCEEDS_OUTSTANDING = "payment exceeds outstanding amount"
 PAYMENT_ALREADY_REVERSED = "payment already reversed"
 REVERSAL_AMOUNT_INVALID = "paid amount would become negative after reversal"
+PLAN_ALREADY_ACCEPTED = "installment plan already accepted"
+PLAN_NOT_ACCEPTED = "installment plan not accepted"
+PLAN_AMOUNT_MISMATCH = "installment amounts do not add up to order amount"
+PLAN_DUPLICATE_ID = "duplicate installment id"
+PLAN_AMOUNT_NOT_POSITIVE = "installment amount must be positive"
+INSTALLMENT_ID_REQUIRED = "installment id is required"
+INSTALLMENT_NOT_FOUND = "installment not found"
+INSTALLMENT_ALREADY_PAID = "installment already paid"
+INSTALLMENT_AMOUNT_MISMATCH = "payment amount does not match installment amount"
 
 
 class LedgerError(Exception):
@@ -48,7 +57,7 @@ def get(tenant: str, order_id: str) -> dict | None:
     return {**dict(row), "outstanding_cents": outstanding}
 
 
-def add_payment(tenant: str, order_id: str, amount_cents: int, originator: str) -> dict | None:
+def add_payment(tenant: str, order_id: str, amount_cents: int, originator: str, installment_id: str | None = None) -> dict | None:
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -59,16 +68,53 @@ def add_payment(tenant: str, order_id: str, amount_cents: int, originator: str) 
         if row is None:
             conn.execute("ROLLBACK")
             return None
-        if amount_cents <= 0 or row["paid_cents"] + amount_cents > row["amount_cents"]:
-            conn.execute("ROLLBACK")
-            raise LedgerError(PAYMENT_EXCEEDS_OUTSTANDING)
+
+        has_plan = conn.execute(
+            "SELECT 1 FROM installments WHERE tenant=? AND order_id=? LIMIT 1",
+            (tenant, order_id),
+        ).fetchone() is not None
+
+        installment = None
+        if has_plan:
+            # 已受理分期计划：必须声明期次，且金额必须等于该期应收
+            if not installment_id:
+                conn.execute("ROLLBACK")
+                raise LedgerError(INSTALLMENT_ID_REQUIRED)
+            installment = conn.execute(
+                "SELECT amount_cents, status FROM installments WHERE tenant=? AND order_id=? AND installment_id=?",
+                (tenant, order_id, installment_id),
+            ).fetchone()
+            if installment is None:
+                conn.execute("ROLLBACK")
+                raise LedgerError(INSTALLMENT_NOT_FOUND)
+            if installment["status"] == "paid":
+                # 同一期次至多收讫一笔：并发或重放都落到此处，账面不变、不留痕
+                conn.execute("ROLLBACK")
+                raise LedgerError(INSTALLMENT_ALREADY_PAID)
+            if amount_cents != installment["amount_cents"]:
+                conn.execute("ROLLBACK")
+                raise LedgerError(INSTALLMENT_AMOUNT_MISMATCH)
+        else:
+            # 未受理分期计划：保持整单收款语义，不允许按期次收款
+            if installment_id:
+                conn.execute("ROLLBACK")
+                raise LedgerError(PLAN_NOT_ACCEPTED)
+            if amount_cents <= 0 or row["paid_cents"] + amount_cents > row["amount_cents"]:
+                conn.execute("ROLLBACK")
+                raise LedgerError(PAYMENT_EXCEEDS_OUTSTANDING)
+
         record_id = _new_record_id("pay")
-        # 留痕与账面推进在同一事务内原子提交
+        # 留痕、期次状态与账面推进在同一事务内原子提交
         conn.execute(
-            """INSERT INTO payment_records(tenant, order_id, record_id, record_type, amount_cents, originator, related_record_id, created_at)
-               VALUES(?,?,?,'payment',?,?,NULL,?)""",
-            (tenant, order_id, record_id, amount_cents, originator, _now()),
+            """INSERT INTO payment_records(tenant, order_id, record_id, record_type, amount_cents, originator, related_record_id, created_at, installment_id)
+               VALUES(?,?,?,'payment',?,?,NULL,?,?)""",
+            (tenant, order_id, record_id, amount_cents, originator, _now(), installment_id),
         )
+        if installment is not None:
+            conn.execute(
+                "UPDATE installments SET status='paid', paid_record_id=? WHERE tenant=? AND order_id=? AND installment_id=?",
+                (record_id, tenant, order_id, installment_id),
+            )
         conn.execute(
             "UPDATE orders SET paid_cents = paid_cents + ?, status = CASE WHEN paid_cents + ? >= amount_cents THEN 'settled' ELSE 'accepted' END WHERE tenant=? AND order_id=?",
             (amount_cents, amount_cents, tenant, order_id),
@@ -94,7 +140,7 @@ def reverse_payment(tenant: str, order_id: str, record_id: str, originator: str)
 
         # 只能冲正属于当前租户、且挂在该订单下的收款；否则一律按流水不存在处理
         payment = conn.execute(
-            "SELECT amount_cents FROM payment_records WHERE tenant=? AND order_id=? AND record_id=? AND record_type='payment'",
+            "SELECT amount_cents, installment_id FROM payment_records WHERE tenant=? AND order_id=? AND record_id=? AND record_type='payment'",
             (tenant, order_id, record_id),
         ).fetchone()
         if payment is None:
@@ -127,6 +173,12 @@ def reverse_payment(tenant: str, order_id: str, record_id: str, originator: str)
             # 唯一索引兜底：并发下同一收款也只允许一次冲正，账面不变更
             conn.execute("ROLLBACK")
             raise LedgerError(PAYMENT_ALREADY_REVERSED)
+        if payment["installment_id"]:
+            # 分期收款的冲正必须连同期次一起退回未收，与账面在同一事务内提交
+            conn.execute(
+                "UPDATE installments SET status='unpaid', paid_record_id=NULL WHERE tenant=? AND order_id=? AND installment_id=?",
+                (tenant, order_id, payment["installment_id"]),
+            )
         conn.execute(
             "UPDATE orders SET paid_cents=?, status=CASE WHEN ? >= amount_cents THEN 'settled' ELSE 'accepted' END WHERE tenant=? AND order_id=?",
             (new_paid, new_paid, tenant, order_id),
@@ -148,10 +200,79 @@ def list_records(tenant: str, order_id: str) -> list[dict] | None:
         if order is None:
             return None
         rows = conn.execute(
-            """SELECT record_id, record_type, amount_cents, created_at, originator, related_record_id
+            """SELECT record_id, record_type, amount_cents, created_at, originator, related_record_id, installment_id
                FROM payment_records
                WHERE tenant=? AND order_id=?
                ORDER BY created_at, record_id""",
+            (tenant, order_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def register_plan(tenant: str, order_id: str, items: list[dict]) -> list[dict] | None:
+    """受理分期计划。订单不存在返回 None；计划不合法或已受理抛 LedgerError，且不留任何一期。"""
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        order = conn.execute(
+            "SELECT amount_cents FROM orders WHERE tenant=? AND order_id=?",
+            (tenant, order_id),
+        ).fetchone()
+        if order is None:
+            conn.execute("ROLLBACK")
+            return None
+
+        # 整份计划先校验后落库：任一不合法则整体拒绝
+        ids = [item["installment_id"] for item in items]
+        if len(set(ids)) != len(ids):
+            conn.execute("ROLLBACK")
+            raise LedgerError(PLAN_DUPLICATE_ID)
+        if any(item["amount_cents"] <= 0 for item in items):
+            conn.execute("ROLLBACK")
+            raise LedgerError(PLAN_AMOUNT_NOT_POSITIVE)
+        if sum(item["amount_cents"] for item in items) != order["amount_cents"]:
+            conn.execute("ROLLBACK")
+            raise LedgerError(PLAN_AMOUNT_MISMATCH)
+
+        existing = conn.execute(
+            "SELECT 1 FROM installments WHERE tenant=? AND order_id=? LIMIT 1",
+            (tenant, order_id),
+        ).fetchone()
+        if existing is not None:
+            # 同一订单的分期计划只能受理一次，已受理的计划不被改动
+            conn.execute("ROLLBACK")
+            raise LedgerError(PLAN_ALREADY_ACCEPTED)
+
+        now = _now()
+        for item in items:
+            conn.execute(
+                """INSERT INTO installments(tenant, order_id, installment_id, amount_cents, due_at, status, paid_record_id, created_at)
+                   VALUES(?,?,?,?,?,'unpaid',NULL,?)""",
+                (tenant, order_id, item["installment_id"], item["amount_cents"], item["due_at"], now),
+            )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    return list_installments(tenant, order_id)
+
+
+def list_installments(tenant: str, order_id: str) -> list[dict] | None:
+    """返回订单的分期计划与各期收讫状态；订单不存在（含跨租户）返回 None。"""
+    conn = connect()
+    try:
+        order = conn.execute(
+            "SELECT 1 FROM orders WHERE tenant=? AND order_id=?",
+            (tenant, order_id),
+        ).fetchone()
+        if order is None:
+            return None
+        rows = conn.execute(
+            """SELECT installment_id, amount_cents, due_at, status, paid_record_id
+               FROM installments
+               WHERE tenant=? AND order_id=?
+               ORDER BY created_at, installment_id""",
             (tenant, order_id),
         ).fetchall()
     finally:

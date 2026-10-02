@@ -18,5 +18,9 @@ def migrate() -> None:
     try:
         for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
             conn.executescript(path.read_text(encoding="utf-8"))
+        # 分期收款：流水需记录对应期次；ALTER 无 IF NOT EXISTS，按现状幂等补齐
+        columns = [row["name"] for row in conn.execute("PRAGMA table_info(payment_records)")]
+        if "installment_id" not in columns:
+            conn.execute("ALTER TABLE payment_records ADD COLUMN installment_id TEXT")
     finally:
         conn.close()
