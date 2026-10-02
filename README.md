@@ -30,6 +30,15 @@
 - 分期订单的收款：受理分期计划后，`POST /orders/{order_id}/payments` 必须声明 `installment_id`，且 `amount_cents` 必须等于该期应收。失败原因可区分：未声明期次 409（`installment id is required`）、金额不等 409（`payment amount does not match installment amount`）、期次不存在 409（`installment not found`）、期次已收讫 409（`installment already paid`）、未受理计划却按期次收款 409（`installment plan not accepted`）；任一失败都不改动账面与留痕。同一期次并发收款至多一笔成功。全部期次收讫时订单结清。收款流水的 `installment_id` 字段记录对应期次（整单收款为 `null`）。
 - `POST /payments/import`：批量收款导入。请求字段 `file_path`（CSV 文件路径）与可选 `originator`（发起方标识，缺省取 `X-Originator` 头，再缺省取租户标识，与单笔收款一致）。CSV 每行给出 `order_id,amount_cents[,installment_id]`（首行可为表头）。导入按文件行序逐行受理，每行的校验与账面推进完全等同于单笔收款；任一行不合法只拒绝该行（含 `invalid line`、`order not found` 及单笔收款的全部可区分原因），不影响同批其他行，也不留部分效果。响应 200 含 `batch_id`（导入批次标识）与 `results` 逐行结论：成功行给出该订单受理后的 `paid_cents`、`outstanding_cents`、`order_status` 与收款流水 `record_id`（流水与单笔收款同构，可正常冲正与退款），失败行给出 `reason`。同一（租户, 文件路径, 发起方标识）重复提交视为同一批次：已完成的批次直接返回首次结论，不重复记账、不重复留痕；中途宕机的批次续跑同一文件只补齐缺失行。文件不可读返回 400；跨租户订单一律按 `order not found` 处理，不泄漏对象是否存在。
 - `GET /payments/import/{batch_id}`：凭批次标识查询导入的逐行结论（含中断批次的已完成行，`status` 为 `running` / `completed`）。批次不存在或跨租户返回 404，不泄漏批次是否存在。
+- `GET /orders`（订单账面条件检索）：仅在当前租户（`X-Tenant`）内生效，跨租户不泄漏任何订单是否存在。全部查询参数均可选，同时给定时按同时满足处理；不传任何条件返回该租户全部订单。结果按 `order_id` 升序给出，每条为订单的当前账面快照：`order_id`、`amount_cents`、`paid_cents`、`outstanding_cents`、`currency`、`status`。支持参数：
+  - `status`：`settled`（已结清，即未收金额为 0）或 `unsettled`（未结清，未收为正）；状态按查询当下账面判定，退款或冲正使未收转正后自然回到未结清。
+  - `currency`：三位大写币种码（与受理订单一致，如 `CNY`）。
+  - `min_amount_cents` / `max_amount_cents`：应收金额（订单金额）闭区间过滤，整数、非负；下限大于上限返回 400 `min_amount_cents must not be greater than max_amount_cents`。
+  - `payment_originator`：只保留发起过收款的订单——存在该发起方标识的 `payment` 流水即可命中（其收款事后被冲正或退款不改变“发起过”的事实）。
+  - `has_installment_plan`：`true` 只返回受理过分期计划的订单，`false` 只返回未受理的订单。
+  - `page_size`：单页条数，正整数，缺省 50；非正或非整数返回 400 `page_size must be a positive integer` / `page_size must be an integer`。
+  - `continuation_token`：上一页响应里的续取标记（对调用方不透明）；首次请求不带；无法解析返回 400 `continuation token is not parseable`。
+  - 响应：`{"orders": [...], "continuation_token": "…"}`；以 `order_id` 为稳定排序键的 keyset 翻页，翻页过程中新增或变更的单据不会造成重复返回或跳过；还有下一页时 `continuation_token` 非空，末页（含无结果）返回空列表与空标记。其余可区分 400 原因：缺租户头 `tenant header is required`、`status must be 'settled' or 'unsettled'`、`currency must be a 3-letter uppercase code` / `unsupported currency`、`has_installment_plan must be 'true' or 'false'`、`min_amount_cents must not be negative` 等。
 - `GET /health`：返回服务与数据库状态。
 
 ### 调用示例
@@ -81,6 +90,16 @@ curl -s -XPOST localhost:8000/payments/import \
 
 # 凭批次标识查询逐行结论（含中断批次的已完成行）
 curl -s localhost:8000/payments/import/imp_ab12... -H 'X-Tenant: t1'
+
+# 条件检索订单账面快照：未结清 + CNY + 金额区间 + alice 发起过收款 + 未受理分期，每页 20 条
+curl -s 'localhost:8000/orders?status=unsettled&currency=CNY&min_amount_cents=100&max_amount_cents=1000&payment_originator=alice&has_installment_plan=false&page_size=20' \
+  -H 'X-Tenant: t1'
+
+# 用响应中的 continuation_token 续取下一页；标记为空表示已取完（无结果时 orders 与标记均为空）
+curl -s 'localhost:8000/orders?page_size=20&continuation_token=eyJhZnRlcl9v...' -H 'X-Tenant: t1'
+
+# 不带任何条件：按订单标识升序分页返回当前租户全部订单
+curl -s 'localhost:8000/orders?page_size=50' -H 'X-Tenant: t1'
 ```
 
 ## 数据与配置

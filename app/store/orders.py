@@ -441,3 +441,94 @@ def list_installments(tenant: str, order_id: str) -> list[dict] | None:
     finally:
         conn.close()
     return [dict(row) for row in rows]
+
+
+# 条件检索支持的账面状态取值：按查询当下账面含义判定（未收为 0 即已结清）
+SEARCH_STATUS_SETTLED = "settled"
+SEARCH_STATUS_UNSETTLED = "unsettled"
+
+
+def search_orders(
+    tenant: str,
+    *,
+    status: str | None = None,
+    currency: str | None = None,
+    min_amount_cents: int | None = None,
+    max_amount_cents: int | None = None,
+    payment_originator: str | None = None,
+    has_installment_plan: bool | None = None,
+    page_size: int,
+    after_order_id: str | None = None,
+) -> tuple[list[dict], bool]:
+    """租户内按条件检索订单账面快照，以订单标识为稳定排序键做 keyset 分页。
+
+    多个条件同时给定时按同时满足处理；始终限定 tenant，任何条件下都不返回其他
+    租户的订单。状态不读落库 status 列，而按查询当下的“订单金额−已收金额”判定，
+    退款/冲正使未收转正后自然回到未结清。
+
+    取 page_size+1 行判断是否还有下一页，返回 (本页订单, 是否还有更多)。
+    翻页只沿不可变的 order_id 键前进（WHERE order_id > 上页末单），因此翻页过程中
+    新增或变更的单据既不会让已返回的订单重复出现，也不会让此前符合条件的订单被跳过。
+    """
+    where = ["tenant = ?"]
+    params: list = [tenant]
+    if status == SEARCH_STATUS_SETTLED:
+        where.append("amount_cents - paid_cents = 0")
+    elif status == SEARCH_STATUS_UNSETTLED:
+        where.append("amount_cents - paid_cents > 0")
+    if currency is not None:
+        where.append("currency = ?")
+        params.append(currency)
+    if min_amount_cents is not None:
+        where.append("amount_cents >= ?")
+        params.append(min_amount_cents)
+    if max_amount_cents is not None:
+        where.append("amount_cents <= ?")
+        params.append(max_amount_cents)
+    if payment_originator is not None:
+        # “发起过收款”：存在一条该发起方留下的 payment 流水（冲正/退款不改变发起事实）
+        where.append(
+            "EXISTS (SELECT 1 FROM payment_records pr WHERE pr.tenant = orders.tenant "
+            "AND pr.order_id = orders.order_id AND pr.record_type = 'payment' AND pr.originator = ?)"
+        )
+        params.append(payment_originator)
+    if has_installment_plan is not None:
+        plan_clause = (
+            "EXISTS (SELECT 1 FROM installments ins WHERE ins.tenant = orders.tenant "
+            "AND ins.order_id = orders.order_id)"
+        )
+        where.append(plan_clause if has_installment_plan else f"NOT {plan_clause}")
+    if after_order_id is not None:
+        # 稳定续取：只取排序键严格大于上页末单的行
+        where.append("order_id > ?")
+        params.append(after_order_id)
+
+    sql = (
+        "SELECT order_id, amount_cents, paid_cents, currency, status FROM orders "
+        + " WHERE " + " AND ".join(where)
+        + " ORDER BY order_id ASC LIMIT ?"
+    )
+    params.append(page_size + 1)
+    conn = connect()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+    has_more = len(rows) > page_size
+    page = rows[:page_size]
+    items = []
+    for row in page:
+        outstanding = row["amount_cents"] - row["paid_cents"]
+        items.append(
+            {
+                "order_id": row["order_id"],
+                "amount_cents": row["amount_cents"],
+                "paid_cents": row["paid_cents"],
+                "outstanding_cents": outstanding,
+                "currency": row["currency"],
+                # 当前状态按查询当下账面含义给出，保证快照内未收与状态始终自洽
+                "status": "settled" if outstanding == 0 else "accepted",
+            }
+        )
+    return items, has_more
