@@ -1,7 +1,7 @@
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timezone
 
-from app.rules.time_rules import to_storage
+from app.rules.time_rules import to_display, to_storage
 from app.store.db import connect
 
 # 状态口径：已收金额达到订单金额为已结清，否则为未收清（含未登记收款）。
@@ -48,7 +48,6 @@ def add_payment(
 ) -> dict | None:
     if business_time is None:
         business_time = datetime.now(UTC)
-    business_time = business_time.astimezone(UTC)
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -67,16 +66,17 @@ def add_payment(
             (amount_cents, amount_cents, tenant, order_id),
         )
         # 收款生效后在同一事务内追加流水；失败路径已回滚，不会留下流水。
+        # business_time 落库统一 UTC 供比较；business_time_text 保留登记时的偏移写法供读回。
         paid_after = row["paid_cents"] + amount_cents
         seq = _next_flow_seq(conn, tenant, order_id)
         conn.execute(
             "INSERT INTO order_flow(tenant, order_id, seq, entry_id, entry_type, amount_cents,"
-            " paid_cents, outstanding_cents, status, reversal_id, business_time)"
-            " VALUES(?,?,?,?,?,?,?,?,?,NULL,?)",
+            " paid_cents, outstanding_cents, status, reversal_id, business_time, business_time_text)"
+            " VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?)",
             (
                 tenant, order_id, seq, f"pay-{seq}", "payment", amount_cents,
                 paid_after, row["amount_cents"] - paid_after, _settled(paid_after, row["amount_cents"]),
-                to_storage(business_time),
+                to_storage(business_time), to_display(business_time),
             ),
         )
         conn.execute("COMMIT")
@@ -100,7 +100,6 @@ def reverse_payment(
     """
     if business_time is None:
         business_time = datetime.now(UTC)
-    business_time = business_time.astimezone(UTC)
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -136,12 +135,12 @@ def reverse_payment(
         seq = _next_flow_seq(conn, tenant, order_id)
         conn.execute(
             "INSERT INTO order_flow(tenant, order_id, seq, entry_id, entry_type, amount_cents,"
-            " paid_cents, outstanding_cents, status, reversal_id, business_time)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            " paid_cents, outstanding_cents, status, reversal_id, business_time, business_time_text)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 tenant, order_id, seq, f"rev-{seq}", "reversal", amount_cents,
                 paid_after, row["amount_cents"] - paid_after, _settled(paid_after, row["amount_cents"]),
-                reversal_id, to_storage(business_time),
+                reversal_id, to_storage(business_time), to_display(business_time),
             ),
         )
         conn.execute("COMMIT")
@@ -165,7 +164,8 @@ def list_flow(tenant: str, order_id: str) -> list[dict] | None:
             return None
         rows = conn.execute(
             "SELECT seq, entry_id, entry_type, amount_cents, paid_cents, outstanding_cents, status,"
-            " reversal_id, business_time FROM order_flow WHERE tenant=? AND order_id=? ORDER BY seq ASC",
+            " reversal_id, business_time_text AS business_time"
+            " FROM order_flow WHERE tenant=? AND order_id=? ORDER BY seq ASC",
             (tenant, order_id),
         ).fetchall()
     finally:
@@ -195,10 +195,70 @@ def list_flow_range(
             return None
         rows = conn.execute(
             "SELECT seq, entry_id, entry_type, amount_cents, paid_cents, outstanding_cents, status,"
-            " reversal_id, business_time FROM order_flow"
+            " reversal_id, business_time_text AS business_time FROM order_flow"
             " WHERE tenant=? AND order_id=? AND business_time >= ? AND business_time <= ? ORDER BY seq ASC",
             (tenant, order_id, to_storage(start), to_storage(end)),
         ).fetchall()
     finally:
         conn.close()
     return [dict(row) for row in rows]
+
+
+def summarize_flow_by_day(
+    tenant: str, order_id: str, start: datetime, end: datetime, tz: timezone
+) -> list[dict] | None:
+    """按对账时区的日历日汇总该订单在闭区间 [start, end] 内生效的收款与冲正。
+
+    订单不存在或属于其他租户时返回 None（调用方按 404 处理，不泄漏对象是否存在）。
+    区间过滤以 business_time（UTC 文本）为准，与区间查询口径一致；每条流水换算到
+    对账时区偏移后按日历日归组，恰计入一个分组。每组返回该日收款合计、冲正合计、
+    流水条数与组内最早/最晚的业务发生时间（按登记时的偏移写法）；无流水的日期不出现，
+    结果按日期升序。调用方负责先校验入参；本函数只读数据。
+    """
+    conn = connect()
+    try:
+        owned = conn.execute(
+            "SELECT 1 FROM orders WHERE tenant=? AND order_id=?",
+            (tenant, order_id),
+        ).fetchone()
+        if owned is None:
+            return None
+        rows = conn.execute(
+            "SELECT entry_type, amount_cents, business_time, business_time_text FROM order_flow"
+            " WHERE tenant=? AND order_id=? AND business_time >= ? AND business_time <= ? ORDER BY seq ASC",
+            (tenant, order_id, to_storage(start), to_storage(end)),
+        ).fetchall()
+    finally:
+        conn.close()
+    groups: dict[str, dict] = {}
+    for row in rows:
+        instant = datetime.fromisoformat(row["business_time"])
+        day = instant.astimezone(tz).date().isoformat()
+        group = groups.setdefault(day, {
+            "date": day,
+            "payment_cents": 0,
+            "reversal_cents": 0,
+            "entry_count": 0,
+            "first_business_time": None,
+            "last_business_time": None,
+            "_first_instant": None,
+            "_last_instant": None,
+        })
+        if row["entry_type"] == "payment":
+            group["payment_cents"] += row["amount_cents"]
+        else:
+            group["reversal_cents"] += row["amount_cents"]
+        group["entry_count"] += 1
+        if group["_first_instant"] is None or instant < group["_first_instant"]:
+            group["_first_instant"] = instant
+            group["first_business_time"] = row["business_time_text"]
+        if group["_last_instant"] is None or instant > group["_last_instant"]:
+            group["_last_instant"] = instant
+            group["last_business_time"] = row["business_time_text"]
+    days = []
+    for day in sorted(groups):
+        group = groups[day]
+        del group["_first_instant"]
+        del group["_last_instant"]
+        days.append(group)
+    return days
