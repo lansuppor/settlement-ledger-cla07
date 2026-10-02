@@ -1,10 +1,12 @@
 import argparse
-from fastapi import FastAPI, Header, HTTPException, Response
+
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from app.config import tenant_header
+
+from app.rules import order_rules
 from app.store import orders
 from app.store.db import connect, migrate
-from app.rules import order_rules
+from app.store.orders import LedgerError
 
 app = FastAPI(title="settlement-ledger")
 
@@ -38,7 +40,7 @@ def create_order(body: OrderIn) -> dict:
     return orders.get(body.tenant, body.order_id)
 
 @app.get("/orders/{order_id}")
-def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) -> dict:
+def read_order(order_id: str, x_tenant: str = Header(default="")) -> dict:
     tenant = x_tenant or ""
     if not tenant:
         raise HTTPException(status_code=400, detail="tenant header is required")
@@ -48,13 +50,42 @@ def read_order(order_id: str, x_tenant: str = Header(default="", alias=None)) ->
     return order
 
 @app.post("/orders/{order_id}/payments")
-def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="")) -> dict:
+def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default=""), x_originator: str = Header(default="")) -> dict:
     if not x_tenant:
         raise HTTPException(status_code=400, detail="tenant header is required")
+    originator = x_originator or x_tenant
     try:
-        order = orders.add_payment(x_tenant, order_id, body.amount_cents)
-    except ValueError as error:
+        order = orders.add_payment(x_tenant, order_id, body.amount_cents, originator)
+    except LedgerError as error:
         raise HTTPException(status_code=409, detail=str(error))
+    if order is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return order
+
+@app.get("/orders/{order_id}/payments")
+def list_payments(order_id: str, x_tenant: str = Header(default="")) -> dict:
+    """收款流水查询：按发生顺序返回该订单的全部收款与冲正。"""
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    records = orders.list_records(x_tenant, order_id)
+    if records is None:
+        # 订单不存在或跨租户，一律按不存在处理
+        raise HTTPException(status_code=404, detail="order not found")
+    return {"order_id": order_id, "records": records}
+
+@app.post("/orders/{order_id}/payments/{record_id}/reversal", status_code=201)
+def reverse_payment(order_id: str, record_id: str, x_tenant: str = Header(default=""), x_originator: str = Header(default="")) -> dict:
+    """冲正一笔已登记的收款。"""
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    originator = x_originator or x_tenant
+    try:
+        order = orders.reverse_payment(x_tenant, order_id, record_id, originator)
+    except LedgerError as error:
+        detail = str(error)
+        if detail == "payment record not found":
+            raise HTTPException(status_code=404, detail=detail)
+        raise HTTPException(status_code=409, detail=detail)
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
