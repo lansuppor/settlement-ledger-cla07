@@ -28,6 +28,8 @@
 - `POST /orders/{order_id}/installments`：受理分期计划。请求字段 `installments` 为若干期明细，每期含 `installment_id`（期次标识）、`amount_cents`（应收金额）、`due_at`（到期时间）。成功返回 201 与完整计划；各期金额之和必须等于订单金额、期次标识不得重复、金额必须为正，任一不合法整份拒绝且不留任何一期（金额求和不符 409 `installment amounts do not add up to order amount`，期次重复 409 `duplicate installment id`，非正金额 422）；同一订单重复受理返回 409（`installment plan already accepted`）且不改动已受理计划；订单不存在或跨租户返回 404。
 - `GET /orders/{order_id}/installments`：分期计划查询。返回该订单各期的 `installment_id`、`amount_cents`、`due_at`、`status`（`unpaid` / `paid`）与 `paid_record_id`（收讫该期的收款流水标识）；未受理计划时返回空列表；订单不存在或跨租户返回 404。
 - 分期订单的收款：受理分期计划后，`POST /orders/{order_id}/payments` 必须声明 `installment_id`，且 `amount_cents` 必须等于该期应收。失败原因可区分：未声明期次 409（`installment id is required`）、金额不等 409（`payment amount does not match installment amount`）、期次不存在 409（`installment not found`）、期次已收讫 409（`installment already paid`）、未受理计划却按期次收款 409（`installment plan not accepted`）；任一失败都不改动账面与留痕。同一期次并发收款至多一笔成功。全部期次收讫时订单结清。收款流水的 `installment_id` 字段记录对应期次（整单收款为 `null`）。
+- `POST /payments/import`：批量收款导入。请求字段 `file_path`（CSV 文件路径）与可选 `originator`（发起方标识，缺省取 `X-Originator` 头，再缺省取租户标识，与单笔收款一致）。CSV 每行给出 `order_id,amount_cents[,installment_id]`（首行可为表头）。导入按文件行序逐行受理，每行的校验与账面推进完全等同于单笔收款；任一行不合法只拒绝该行（含 `invalid line`、`order not found` 及单笔收款的全部可区分原因），不影响同批其他行，也不留部分效果。响应 200 含 `batch_id`（导入批次标识）与 `results` 逐行结论：成功行给出该订单受理后的 `paid_cents`、`outstanding_cents`、`order_status` 与收款流水 `record_id`（流水与单笔收款同构，可正常冲正与退款），失败行给出 `reason`。同一（租户, 文件路径, 发起方标识）重复提交视为同一批次：已完成的批次直接返回首次结论，不重复记账、不重复留痕；中途宕机的批次续跑同一文件只补齐缺失行。文件不可读返回 400；跨租户订单一律按 `order not found` 处理，不泄漏对象是否存在。
+- `GET /payments/import/{batch_id}`：凭批次标识查询导入的逐行结论（含中断批次的已完成行，`status` 为 `running` / `completed`）。批次不存在或跨租户返回 404，不泄漏批次是否存在。
 - `GET /health`：返回服务与数据库状态。
 
 ### 调用示例
@@ -70,6 +72,15 @@ curl -s -XPOST localhost:8000/orders/o2/payments \
 
 # 查询分期计划与各期收讫状态
 curl -s localhost:8000/orders/o2/installments -H 'X-Tenant: t1'
+
+# 批量收款导入：CSV 每行 order_id,amount_cents[,installment_id]
+# 响应含 batch_id 与逐行结论；同（文件路径, 发起方）重复提交返回首次结论，不重复记账
+curl -s -XPOST localhost:8000/payments/import \
+  -H 'X-Tenant: t1' -H 'Content-Type: application/json' \
+  -d '{"file_path": "fixtures/payments.csv", "originator": "erp"}'
+
+# 凭批次标识查询逐行结论（含中断批次的已完成行）
+curl -s localhost:8000/payments/import/imp_ab12... -H 'X-Tenant: t1'
 ```
 
 ## 数据与配置

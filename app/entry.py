@@ -4,8 +4,9 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
-from app.store import orders
+from app.store import imports, orders
 from app.store.db import connect, migrate
+from app.store.imports import ImportFileError
 from app.store.orders import LedgerError
 
 app = FastAPI(title="settlement-ledger")
@@ -32,6 +33,10 @@ class InstallmentIn(BaseModel):
 
 class PlanIn(BaseModel):
     installments: list[InstallmentIn] = Field(min_length=1)
+
+class PaymentImportIn(BaseModel):
+    file_path: str = Field(min_length=1)
+    originator: str | None = Field(default=None, min_length=1)
 
 @app.get("/health")
 def health() -> dict:
@@ -148,6 +153,28 @@ def refund_payment(order_id: str, record_id: str, body: RefundIn, x_tenant: str 
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.post("/payments/import")
+def import_payment_batch(body: PaymentImportIn, x_tenant: str = Header(default=""), x_originator: str = Header(default="")) -> dict:
+    """批量收款导入：按 CSV 文件逐行受理，部分失败只拒绝该行，结果含批次标识与逐行结论。"""
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    # 发起方缺省规则与单笔收款一致：未声明时取租户标识
+    originator = body.originator or x_originator or x_tenant
+    try:
+        return imports.import_payments(x_tenant, body.file_path, originator)
+    except ImportFileError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+@app.get("/payments/import/{batch_id}")
+def read_import_batch(batch_id: str, x_tenant: str = Header(default="")) -> dict:
+    """凭批次标识查询导入的逐行结论；批次不存在或跨租户返回 404。"""
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    batch = imports.get_batch(x_tenant, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="import batch not found")
+    return batch
 
 def main() -> None:
     parser = argparse.ArgumentParser()
