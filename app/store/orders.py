@@ -25,6 +25,10 @@ REFUND_EXCEEDS_REFUNDABLE = "refund exceeds refundable amount"
 REFUND_INSTALLMENT_NOT_PAID = "installment is not paid"
 REFUND_INSTALLMENT_AMOUNT_MISMATCH = "refund amount does not match installment amount"
 
+# 请求级幂等相关的可区分业务拒绝原因：幂等键指向不同订单 / 同键但金额或期次声明与首次不同
+IDEMPOTENCY_ORDER_MISMATCH = "idempotency key was used for a different order"
+IDEMPOTENCY_REQUEST_MISMATCH = "idempotency key request does not match the original request"
+
 
 class LedgerError(Exception):
     """账本业务规则冲突（HTTP 层映射为 409）。"""
@@ -71,12 +75,16 @@ def _apply_payment(
     amount_cents: int,
     originator: str,
     installment_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> dict | None:
     """在调用方管理的事务内登记一笔收款：业务校验、留痕、期次与账面推进。
 
     订单不存在（含跨租户）返回 None；业务冲突抛 LedgerError（由调用方回滚）。
     成功返回收款流水标识与受理后账面快照（paid_cents / outstanding_cents / status）。
     单笔登记与批量导入共用本函数，保证两者的校验与账面推进完全等同。
+
+    声明 idempotency_key 时，幂等留痕与收款流水、期次、账面在同一事务内写入：
+    任一业务校验失败整体回滚，失败请求不占用幂等键、不留任何痕迹。
     """
     row = conn.execute(
         "SELECT amount_cents, paid_cents FROM orders WHERE tenant=? AND order_id=?",
@@ -130,30 +138,115 @@ def _apply_payment(
         (amount_cents, amount_cents, tenant, order_id),
     )
     paid = row["paid_cents"] + amount_cents
+    status = "settled" if paid >= row["amount_cents"] else "accepted"
+    outstanding = row["amount_cents"] - paid
+    if idempotency_key is not None:
+        # 幂等留痕与收款流水、期次、账面同事务提交：失败随整体回滚，不占用幂等键
+        conn.execute(
+            """INSERT INTO payment_idempotency(tenant, idempotency_key, order_id, amount_cents, installment_id,
+                                               record_id, paid_cents, outstanding_cents, status, originator, created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (tenant, idempotency_key, order_id, amount_cents, installment_id, record_id,
+             paid, outstanding, status, originator, _now()),
+        )
     return {
         "record_id": record_id,
         "paid_cents": paid,
-        "outstanding_cents": row["amount_cents"] - paid,
-        "status": "settled" if paid >= row["amount_cents"] else "accepted",
+        "outstanding_cents": outstanding,
+        "status": status,
     }
 
 
-def add_payment(tenant: str, order_id: str, amount_cents: int, originator: str, installment_id: str | None = None) -> dict | None:
+def _idempotency_payload(order_id: str, result: dict) -> dict:
+    """幂等收款的统一响应：首次成功与重放都返回同一账面快照与收款流水标识。"""
+    return {
+        "order_id": order_id,
+        "record_id": result["record_id"],
+        "paid_cents": result["paid_cents"],
+        "outstanding_cents": result["outstanding_cents"],
+        "status": result["status"],
+    }
+
+
+def add_payment(
+    tenant: str,
+    order_id: str,
+    amount_cents: int,
+    originator: str,
+    installment_id: str | None = None,
+    idempotency_key: str | None = None,
+) -> dict | None:
+    """登记一笔收款。
+
+    未声明幂等键时保持原有行为：成功返回订单当前账面快照。
+    订单不存在（含跨租户）返回 None；业务冲突抛 LedgerError。
+
+    声明幂等键时按请求级幂等受理（键在租户内唯一标识一次收款意图）：
+    - 首次成功：幂等留痕与收款流水、期次、账面在同一事务提交，返回首次账面快照与流水标识；
+    - 同键同订单同金额同期次的重复请求：不再入账、不再写流水，返回与首次一致的结果；
+    - 同键指向不同订单、或金额/期次声明与首次不同：抛可区分的 LedgerError，不改动任何数据；
+    - 订单不存在或任一业务校验失败：事务回滚，不占用幂等键、不留任何痕迹，校正参数后可用同键成功。
+    """
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if idempotency_key is not None:
+            existing = conn.execute(
+                """SELECT order_id, amount_cents, installment_id, record_id,
+                          paid_cents, outstanding_cents, status
+                   FROM payment_idempotency WHERE tenant=? AND idempotency_key=?""",
+                (tenant, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                # 重放/冲突判定先于一切业务校验：既有键不随当前请求参数再走账
+                if existing["order_id"] != order_id:
+                    conn.execute("ROLLBACK")
+                    raise LedgerError(IDEMPOTENCY_ORDER_MISMATCH)
+                if existing["amount_cents"] != amount_cents or (existing["installment_id"] or None) != (installment_id or None):
+                    conn.execute("ROLLBACK")
+                    raise LedgerError(IDEMPOTENCY_REQUEST_MISMATCH)
+                # 完全一致的重复请求：返回与首次一致的账面快照与流水标识
+                payload = _idempotency_payload(order_id, dict(existing))
+                conn.execute("ROLLBACK")
+                return payload
+
         try:
-            result = _apply_payment(conn, tenant, order_id, amount_cents, originator, installment_id)
+            result = _apply_payment(
+                conn, tenant, order_id, amount_cents, originator, installment_id,
+                idempotency_key=idempotency_key,
+            )
         except LedgerError:
             conn.execute("ROLLBACK")
             raise
+        except sqlite3.IntegrityError as error:
+            # 唯一索引兜底：并发下同键只允许一笔；撞键后改按首次结论重放/判冲突
+            if idempotency_key is None or "payment_idempotency" not in str(error):
+                conn.execute("ROLLBACK")
+                raise
+            existing = conn.execute(
+                """SELECT order_id, amount_cents, installment_id, record_id,
+                          paid_cents, outstanding_cents, status
+                   FROM payment_idempotency WHERE tenant=? AND idempotency_key=?""",
+                (tenant, idempotency_key),
+            ).fetchone()
+            conn.execute("ROLLBACK")
+            if existing is None:
+                raise
+            if existing["order_id"] != order_id:
+                raise LedgerError(IDEMPOTENCY_ORDER_MISMATCH)
+            if existing["amount_cents"] != amount_cents or (existing["installment_id"] or None) != (installment_id or None):
+                raise LedgerError(IDEMPOTENCY_REQUEST_MISMATCH)
+            return _idempotency_payload(order_id, dict(existing))
         if result is None:
+            # 订单不存在（含跨租户）：不占用幂等键
             conn.execute("ROLLBACK")
             return None
         conn.execute("COMMIT")
     finally:
         conn.close()
-    return get(tenant, order_id)
+    if idempotency_key is None:
+        return get(tenant, order_id)
+    return _idempotency_payload(order_id, result)
 
 
 def reverse_payment(tenant: str, order_id: str, record_id: str, originator: str) -> dict | None:

@@ -21,7 +21,7 @@
 
 - `POST /orders`：受理订单。请求字段 `tenant`、`order_id`、`amount_cents`、`currency`。成功返回 201 与订单对象；参数不合法返回 400；同一租户重复受理返回 409。
 - `GET /orders/{order_id}`：按标识读取订单。租户通过请求头 `X-Tenant` 传入；不存在返回 404；跨租户读取返回 404（不泄漏对象是否存在）。
-- `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`；超过未收金额返回 409；成功返回 200 与订单的 `paid_cents`、`outstanding_cents`，同时写入一条类型为 `payment` 的收款流水（发起方可由请求头 `X-Originator` 声明，缺省取租户标识）。
+- `POST /orders/{order_id}/payments`：登记收款。请求字段 `amount_cents`，可选 `installment_id`（分期收款）与 `idempotency_key`（请求级幂等键）；超过未收金额返回 409；成功返回 200 与订单的 `paid_cents`、`outstanding_cents`，同时写入一条类型为 `payment` 的收款流水（发起方可由请求头 `X-Originator` 声明，缺省取租户标识）。声明 `idempotency_key` 时启用请求级幂等（详见下节）：响应额外含 `record_id`（首次成功的收款流水标识），重复请求返回与首次一致的结果；未声明时行为与以往完全一致（响应仍是订单账面快照，不含 `record_id`）。
 - `GET /orders/{order_id}/payments`：收款流水查询。按发生顺序返回该订单的全部收款、冲正与退款记录；每条记录含 `record_id`（业务流水标识）、`record_type`（`payment` 收款 / `reversal` 冲正 / `refund` 退款）、`amount_cents`、`created_at`、`originator`（发起方标识），冲正与退款记录另含 `related_record_id` 指向原收款流水（退款记录另含 `installment_id`，整单退款为 `null`）。订单不存在或跨租户一律返回 404，不泄漏订单是否存在。
 - `POST /orders/{order_id}/payments/{record_id}/reversal`：冲正一笔已登记的收款。冲正金额等于原收款金额（不支持部分冲正），成功返回 201 与冲正后的订单对象，并写入一条 `related_record_id` 关联原流水的 `reversal` 记录。订单不存在返回 404（跨租户同样按不存在处理）；流水不存在或不属于该订单返回 404（`payment record not found`）；重复冲正返回 409（`payment already reversed`）；冲正后账面不合法返回 409。任一失败都不改动已收金额、状态与流水。若原收款是分期收款，冲正会连同期次一起退回未收，该期可再次收讫。
 - `POST /orders/{order_id}/payments/{record_id}/refund`：对一笔已登记的收款登记退款（支持部分退款）。请求字段 `amount_cents`，分期收款必须同时声明 `installment_id`。成功返回 201 与退款后的订单对象，并写入一条 `related_record_id` 关联原收款流水的 `refund` 记录。退款后订单已收金额按净收款（收款−冲正−退款）相应减少，未收金额按“订单金额−净收款”重算：未收转为正数的订单不再结清，净收款全部退完的订单回到未收款状态。失败原因可区分：订单不存在或跨租户返回 404（`order not found`，不泄漏对象是否存在）；原收款流水不存在或不属于该订单/租户返回 404（`payment record not found`）；金额非正返回 409（`refund amount must be positive`）；超过该订单可退余额（当前净收款）或该笔收款剩余可退额返回 409（`refund exceeds refundable amount`）；分期退款未声明期次 409（`installment id is required`）、期次不存在 409（`installment not found`）、该期未收讫 409（`installment is not paid`）、退款金额不等于该期已收金额 409（`refund amount does not match installment amount`）；整单退款声明期次返回 409（`installment plan not accepted`）；同一退款请求（同订单、同原收款、同金额、同期次）重放返回 409（`refund already applied`）。任一失败都不改动已收、未收、状态、期次状态与流水。分期退款成功后该期回到未收并清空 `paid_record_id`，可再次收讫。
@@ -41,6 +41,19 @@
   - 响应：`{"orders": [...], "continuation_token": "…"}`；以 `order_id` 为稳定排序键的 keyset 翻页，翻页过程中新增或变更的单据不会造成重复返回或跳过；还有下一页时 `continuation_token` 非空，末页（含无结果）返回空列表与空标记。其余可区分 400 原因：缺租户头 `tenant header is required`、`status must be 'settled' or 'unsettled'`、`currency must be a 3-letter uppercase code` / `unsupported currency`、`has_installment_plan must be 'true' or 'false'`、`min_amount_cents must not be negative` 等。
 - `GET /health`：返回服务与数据库状态。
 
+### 请求级幂等登记收款
+
+调用方登记收款时可随请求声明一个幂等键，消除网络重试与并发重放导致的重复入账。幂等键在**租户内**唯一标识一次收款意图，与收款流水标识相互独立：流水标识由服务在入账成功后给出，幂等键由调用方提供并保持稳定（建议用 UUID 等足够随机的字符串）。
+
+- 入口仍是 `POST /orders/{order_id}/payments`，在请求体中加 `idempotency_key` 即可，分期收款照常带 `installment_id`。
+- **首次成功**：登记一笔收款、写一条流水，返回首次收款后的订单账面快照（`paid_cents`、`outstanding_cents`、`status`）与该笔收款的 `record_id`、`order_id`。
+- **同键重复请求**（同订单、同金额、同期次声明，无论重试多少次或并发到达）：不再入账、不再写流水，返回与首次**完全一致**的结果（同一 `record_id` 与同一账面快照，即使该笔收款事后被冲正或退款）。
+- **同键但声明不一致**：金额或期次声明与首次不同返回 409 `idempotency key request does not match the original request`；用同一键指向不同订单返回 409 `idempotency key was used for a different order`。两类冲突都不改动任何数据，且冲突判定先于分期、超额等既有校验。
+- **失败请求不占用幂等键**：超额、期次已收讫、订单不存在等被拒绝的请求不留任何痕迹；校正参数后用同一个键即可成功登记。
+- **不绕过既有校验**：分期受理后必须声明期次、金额等于该期应收、同一期次至多收讫一笔、收款不得超过未收金额等规则对幂等请求同样生效。
+- **租户隔离**：跨租户提交相同幂等键互不影响，任何一方都不能读取或借用另一租户的请求身份。
+- 未声明 `idempotency_key` 的收款保持原有行为与响应（订单账面快照，无 `record_id`）。冲正与退款保持各自现有的重放语义，不受幂等键影响；流水查询仍按发生顺序返回，因果链可据此重建。
+
 ### 调用示例
 
 ```bash
@@ -48,6 +61,18 @@
 curl -s -XPOST localhost:8000/orders/o1/payments \
   -H 'X-Tenant: t1' -H 'X-Originator: alice' \
   -H 'Content-Type: application/json' -d '{"amount_cents": 400}'
+
+# 请求级幂等登记：声明稳定的 idempotency_key；响应含首次收款的 record_id 与账面快照
+# 网络重试或并发重放时用完全相同的请求体重发即可，最多登记一笔，返回与首次一致的结果
+curl -s -XPOST localhost:8000/orders/o1/payments \
+  -H 'X-Tenant: t1' -H 'X-Originator: alice' \
+  -H 'Content-Type: application/json' \
+  -d '{"amount_cents": 400, "idempotency_key": "b6f3...e1"}'
+
+# 分期收款同样可声明幂等键（金额/期次须与首次一致，否则 409 冲突且不改动数据）
+curl -s -XPOST localhost:8000/orders/o2/payments \
+  -H 'X-Tenant: t1' -H 'Content-Type: application/json' \
+  -d '{"amount_cents": 300, "installment_id": "i1", "idempotency_key": "inst-i1-0001"}'
 
 # 查询该订单的全部收款/冲正流水
 curl -s localhost:8000/orders/o1/payments -H 'X-Tenant: t1'

@@ -22,6 +22,8 @@ class OrderIn(BaseModel):
 class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
     installment_id: str | None = Field(default=None, min_length=1)
+    # 可选的请求级幂等键：租户内唯一标识一次收款意图；缺省时收款行为与既有完全一致
+    idempotency_key: str | None = Field(default=None, min_length=1)
 
 class RefundIn(BaseModel):
     # 金额为正的业务校验在账本内完成，非正金额返回 409 的可区分原因
@@ -168,7 +170,10 @@ def add_payment(order_id: str, body: PaymentIn, x_tenant: str = Header(default="
         raise HTTPException(status_code=400, detail="tenant header is required")
     originator = x_originator or x_tenant
     try:
-        order = orders.add_payment(x_tenant, order_id, body.amount_cents, originator, installment_id=body.installment_id)
+        order = orders.add_payment(
+            x_tenant, order_id, body.amount_cents, originator,
+            installment_id=body.installment_id, idempotency_key=body.idempotency_key,
+        )
     except LedgerError as error:
         raise HTTPException(status_code=409, detail=str(error))
     if order is None:
