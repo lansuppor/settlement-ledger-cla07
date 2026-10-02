@@ -235,6 +235,47 @@ def list_flow_range(
     return [_flow_dict(row) for row in rows]
 
 
+def _summary_groups(rows: list[sqlite3.Row], offset: timezone, period: str) -> list[dict]:
+    """把闭区间取数得到的流水原始行按对账偏移换算后的日历日或年月归组。
+
+    period 为 "day" 时分组键字段为 date（YYYY-MM-DD，与按日汇总一致）；
+    为 "month" 时为 month（YYYY-MM，月份呈现沿用日汇总日期字段的风格）。
+    每条流水恰计入一个分组；无流水的日/月不出现，结果按分组键升序。
+    first/last 业务发生时间按对账偏移写法返回，基准时刻仍是该条流水自身时刻。
+    """
+    key_field = "date" if period == "day" else "month"
+    groups: dict[str, dict] = {}
+    for row in rows:
+        instant = datetime.fromisoformat(row["business_time"]).replace(tzinfo=UTC)
+        local = instant.astimezone(offset)
+        key = local.date().isoformat() if period == "day" else local.date().isoformat()[:7]
+        group = groups.get(key)
+        if group is None:
+            group = {
+                key_field: key,
+                "payment_cents": 0,
+                "reversal_cents": 0,
+                "entry_count": 0,
+                "first_business_time": instant,
+                "last_business_time": instant,
+            }
+            groups[key] = group
+        if row["entry_type"] == "payment":
+            group["payment_cents"] += row["amount_cents"]
+        else:
+            group["reversal_cents"] += row["amount_cents"]
+        group["entry_count"] += 1
+        group["first_business_time"] = min(group["first_business_time"], instant)
+        group["last_business_time"] = max(group["last_business_time"], instant)
+    result = []
+    for key in sorted(groups):
+        group = groups[key]
+        group["first_business_time"] = to_display(group["first_business_time"], offset)
+        group["last_business_time"] = to_display(group["last_business_time"], offset)
+        result.append(group)
+    return result
+
+
 def daily_summary(
     tenant: str, order_id: str, start: datetime, end: datetime, offset: timezone
 ) -> list[dict] | None:
@@ -259,32 +300,33 @@ def daily_summary(
         rows = _flow_rows_in_range(conn, tenant, order_id, start, end)
     finally:
         conn.close()
-    groups: dict[str, dict] = {}
-    for row in rows:
-        instant = datetime.fromisoformat(row["business_time"]).replace(tzinfo=UTC)
-        day = instant.astimezone(offset).date().isoformat()
-        group = groups.get(day)
-        if group is None:
-            group = {
-                "date": day,
-                "payment_cents": 0,
-                "reversal_cents": 0,
-                "entry_count": 0,
-                "first_business_time": instant,
-                "last_business_time": instant,
-            }
-            groups[day] = group
-        if row["entry_type"] == "payment":
-            group["payment_cents"] += row["amount_cents"]
-        else:
-            group["reversal_cents"] += row["amount_cents"]
-        group["entry_count"] += 1
-        group["first_business_time"] = min(group["first_business_time"], instant)
-        group["last_business_time"] = max(group["last_business_time"], instant)
-    result = []
-    for day in sorted(groups):
-        group = groups[day]
-        group["first_business_time"] = to_display(group["first_business_time"], offset)
-        group["last_business_time"] = to_display(group["last_business_time"], offset)
-        result.append(group)
-    return result
+    return _summary_groups(rows, offset, "day")
+
+
+def monthly_summary(
+    tenant: str, order_id: str, start: datetime, end: datetime, offset: timezone
+) -> list[dict] | None:
+    """按对账时区偏移对闭区间 [start, end] 内的流水按年月汇总。
+
+    订单不存在或属于其他租户时返回 None（调用方按 404 处理，不泄漏对象是否存在）。
+    取数与按日汇总一致：先以 UTC 基准时刻做闭区间过滤，区间外的流水不计入任何月份；
+    再把每条流水换算到对账偏移，以其日历日所在年月归组，恰落入一个月份分组。
+    无流水的月份不出现，结果按月份升序。每组给出收款合计、冲正合计、流水条数，
+    以及组内最早/最晚业务发生时间（按对账偏移写法返回）。同一偏移下与按日汇总闭合：
+    各月合计与条数等于该月内各日分组之和。
+    调用方负责先校验起点、终点与偏移合法且起点不晚于终点；本函数只读数据。
+    """
+    start = start.astimezone(UTC)
+    end = end.astimezone(UTC)
+    conn = connect()
+    try:
+        owned = conn.execute(
+            "SELECT 1 FROM orders WHERE tenant=? AND order_id=?",
+            (tenant, order_id),
+        ).fetchone()
+        if owned is None:
+            return None
+        rows = _flow_rows_in_range(conn, tenant, order_id, start, end)
+    finally:
+        conn.close()
+    return _summary_groups(rows, offset, "month")

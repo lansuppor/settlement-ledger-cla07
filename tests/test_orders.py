@@ -704,3 +704,238 @@ def test_daily_summary_is_scoped_per_tenant() -> None:
     b = _summary("ds7", *_FULL_YEAR, "Z", tenant="t2").json()["groups"]
     assert [(g["date"], g["payment_cents"], g["entry_count"]) for g in a] == [("2026-05-01", 100, 1)]
     assert [(g["date"], g["payment_cents"], g["entry_count"]) for g in b] == [("2026-05-02", 200, 1)]
+
+
+# ---------- 按月汇总（对账时区偏移分组） ----------
+
+def _monthly(order_id: str, start: str, end: str, offset: str, tenant: str = "t1"):
+    return client.get(
+        f"/orders/{order_id}/flow/monthly-summary",
+        params={"start": start, "end": end, "offset": offset},
+        headers={"X-Tenant": tenant},
+    )
+
+
+def _seed_monthly_order(order_id: str = "ms1") -> None:
+    # 四笔流水刻意压在月末/月初边界上，使 +08:00 与 UTC 的月份归属明显不同
+    _new_order(order_id, 100000)
+    client.post(
+        f"/orders/{order_id}/payments",
+        json={"amount_cents": 100, "business_time": "2026-04-30T23:30:00+00:00"},  # +08:00 为 05-01 07:30
+        headers={"X-Tenant": "t1"},
+    )
+    client.post(
+        f"/orders/{order_id}/payments",
+        json={"amount_cents": 200, "business_time": "2026-05-02T01:00:00+08:00"},  # UTC 为 05-01 17:00
+        headers={"X-Tenant": "t1"},
+    )
+    client.post(
+        f"/orders/{order_id}/reversals",
+        json={"reversal_id": f"{order_id}-r", "amount_cents": 50,
+              "business_time": "2026-05-31T23:30:00+00:00"},  # +08:00 为 06-01 07:30
+        headers={"X-Tenant": "t1"},
+    )
+    client.post(
+        f"/orders/{order_id}/payments",
+        json={"amount_cents": 300, "business_time": "2026-06-01T00:30:00+08:00"},  # UTC 为 05-31 16:30
+        headers={"X-Tenant": "t1"},
+    )
+
+
+def test_monthly_summary_groups_by_reconciliation_offset_east() -> None:
+    _seed_monthly_order("ms1")
+    resp = _monthly("ms1", *_FULL_YEAR, "+08:00")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["order_id"] == "ms1" and body["offset"] == "+08:00"
+    groups = body["groups"]
+    # 无流水的月份不出现，结果按月份升序；按 +08:00 归组为 2026-05（两笔收款）与 2026-06（冲正+收款）
+    assert [g["month"] for g in groups] == ["2026-05", "2026-06"]
+    assert groups[0]["payment_cents"] == 300 and groups[0]["reversal_cents"] == 0
+    assert groups[0]["entry_count"] == 2
+    assert groups[0]["first_business_time"] == "2026-05-01T07:30:00+08:00"
+    assert groups[0]["last_business_time"] == "2026-05-02T01:00:00+08:00"
+    assert groups[1]["payment_cents"] == 300 and groups[1]["reversal_cents"] == 50
+    assert groups[1]["entry_count"] == 2
+    assert groups[1]["first_business_time"] == "2026-06-01T00:30:00+08:00"
+    assert groups[1]["last_business_time"] == "2026-06-01T07:30:00+08:00"
+    # 各组条数之和等于区间流水条数，收款与冲正合计分别等于对应流水金额之和
+    assert sum(g["entry_count"] for g in groups) == 4
+    assert sum(g["payment_cents"] for g in groups) == 600
+    assert sum(g["reversal_cents"] for g in groups) == 50
+
+
+def test_monthly_summary_same_instants_group_differently_under_utc() -> None:
+    _seed_monthly_order("ms2")
+    groups = _monthly("ms2", *_FULL_YEAR, "Z").json()["groups"]
+    # 同一批流水换算到 +00:00 后归组不同：2026-04（一笔收款）、2026-05（两笔收款+一笔冲正）
+    assert [g["month"] for g in groups] == ["2026-04", "2026-05"]
+    assert groups[0]["payment_cents"] == 100 and groups[0]["reversal_cents"] == 0
+    assert groups[0]["entry_count"] == 1
+    assert groups[0]["first_business_time"] == groups[0]["last_business_time"] == "2026-04-30T23:30:00+00:00"
+    assert groups[1]["payment_cents"] == 500 and groups[1]["reversal_cents"] == 50
+    assert groups[1]["entry_count"] == 3
+    assert groups[1]["first_business_time"] == "2026-05-01T17:00:00+00:00"
+    assert groups[1]["last_business_time"] == "2026-05-31T23:30:00+00:00"
+    # 跨时区、跨月归组不重不漏：两种偏移下条数与金额合计完全一致
+    east = _monthly("ms2", *_FULL_YEAR, "+08:00").json()["groups"]
+    for key in ("entry_count", "payment_cents", "reversal_cents"):
+        assert sum(g[key] for g in groups) == sum(g[key] for g in east)
+
+
+def test_monthly_summary_is_a_closed_interval_and_closes_with_range_query() -> None:
+    _seed_monthly_order("ms3")
+    earliest = "2026-04-30T23:30:00Z"
+    latest = "2026-05-31T23:30:00Z"
+    # 起点终点恰为这两个边界值时都计入，四条流水全在区间内
+    groups = _monthly("ms3", earliest, latest, "+08:00").json()["groups"]
+    assert sum(g["entry_count"] for g in groups) == 4
+    # 早于起点一秒：最早一笔（+08:00 下归属 5 月）不计入任何月份分组
+    groups = _monthly("ms3", "2026-04-30T23:30:01Z", latest, "+08:00").json()["groups"]
+    assert [g["month"] for g in groups] == ["2026-05", "2026-06"]
+    assert sum(g["entry_count"] for g in groups) == 3
+    assert groups[0]["entry_count"] == 1 and groups[0]["payment_cents"] == 200
+    # 晚于终点一秒：最晚一笔（冲正，+08:00 下归属 6 月）不计入
+    groups = _monthly("ms3", earliest, "2026-05-31T23:29:59Z", "+08:00").json()["groups"]
+    assert sum(g["entry_count"] for g in groups) == 3
+    june = next(g for g in groups if g["month"] == "2026-06")
+    assert june["entry_count"] == 1 and june["reversal_cents"] == 0 and june["payment_cents"] == 300
+    # 与区间查询逐条闭合：同一区间的汇总条数恰等于区间流水条数，金额分别相等
+    ranged = _range("ms3", earliest, latest).json()["entries"]
+    groups = _monthly("ms3", earliest, latest, "-11:00").json()["groups"]
+    assert sum(g["entry_count"] for g in groups) == len(ranged) == 4
+    assert sum(g["payment_cents"] for g in groups) == sum(
+        e["amount_cents"] for e in ranged if e["entry_type"] == "payment"
+    )
+    assert sum(g["reversal_cents"] for g in groups) == sum(
+        e["amount_cents"] for e in ranged if e["entry_type"] == "reversal"
+    )
+
+
+def test_monthly_summary_closes_with_daily_summary_under_same_offset() -> None:
+    _seed_monthly_order("ms4")
+    # 同一区间、同一偏移：各月合计与条数等于该月内各日分组之和，日分组不跨月重复或漏计
+    for zone in ("+08:00", "Z", "-11:00"):
+        months = _monthly("ms4", *_FULL_YEAR, zone).json()["groups"]
+        days = _summary("ms4", *_FULL_YEAR, zone).json()["groups"]
+        rolled: dict[str, dict] = {}
+        for day in days:
+            month = day["date"][:7]
+            agg = rolled.setdefault(
+                month,
+                {"payment_cents": 0, "reversal_cents": 0, "entry_count": 0},
+            )
+            agg["payment_cents"] += day["payment_cents"]
+            agg["reversal_cents"] += day["reversal_cents"]
+            agg["entry_count"] += day["entry_count"]
+        assert [g["month"] for g in months] == sorted(rolled)
+        for group in months:
+            agg = rolled[group["month"]]
+            assert group["payment_cents"] == agg["payment_cents"]
+            assert group["reversal_cents"] == agg["reversal_cents"]
+            assert group["entry_count"] == agg["entry_count"]
+        # 月份区间端点与日分组一致：月内最早/最晚时间分别等于首日/末日分组的对应值
+        by_day = {d["date"]: d for d in days}
+        for group in months:
+            in_month = [d for d in days if d["date"].startswith(group["month"])]
+            assert group["first_business_time"] == by_day[in_month[0]["date"]]["first_business_time"]
+            assert group["last_business_time"] == by_day[in_month[-1]["date"]]["last_business_time"]
+
+
+def test_monthly_summary_empty_window_and_order_without_entries() -> None:
+    _seed_monthly_order("ms5")
+    resp = _monthly("ms5", "2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z", "+08:00")
+    assert resp.status_code == 200 and resp.json()["groups"] == []
+    _new_order("ms5empty", 500)
+    resp = _monthly("ms5empty", *_FULL_YEAR, "Z")
+    assert resp.status_code == 200 and resp.json()["groups"] == []
+
+
+def test_monthly_summary_requires_valid_params_and_distinguishes_errors() -> None:
+    _seed_monthly_order("ms6")
+    base = {"start": "2026-05-01T00:00:00Z", "end": "2026-05-31T23:59:59Z", "offset": "+08:00"}
+    resp = client.get("/orders/ms6/flow/monthly-summary", params={"end": base["end"], "offset": "+08:00"}, headers={"X-Tenant": "t1"})
+    assert resp.status_code == 400 and resp.json()["detail"] == "start is required"
+    resp = client.get("/orders/ms6/flow/monthly-summary", params={"start": base["start"], "offset": "+08:00"}, headers={"X-Tenant": "t1"})
+    assert resp.status_code == 400 and resp.json()["detail"] == "end is required"
+    resp = client.get("/orders/ms6/flow/monthly-summary", params={"start": base["start"], "end": base["end"]}, headers={"X-Tenant": "t1"})
+    assert resp.status_code == 400 and resp.json()["detail"] == "offset is required"
+    resp = client.get(
+        "/orders/ms6/flow/monthly-summary",
+        params={"start": "2026-05-01", "end": base["end"], "offset": "+08:00"},
+        headers={"X-Tenant": "t1"},
+    )
+    assert resp.status_code == 400 and resp.json()["detail"].startswith("start ")
+    resp = client.get(
+        "/orders/ms6/flow/monthly-summary",
+        params={"start": base["start"], "end": "2026-05-31T23:59:59", "offset": "+08:00"},
+        headers={"X-Tenant": "t1"},
+    )
+    assert resp.status_code == 400 and resp.json()["detail"].startswith("end ")
+    for bad_offset in ("08:00", "+8:00", "abc", "+0800"):
+        resp = client.get(
+            "/orders/ms6/flow/monthly-summary",
+            params={"start": base["start"], "end": base["end"], "offset": bad_offset},
+            headers={"X-Tenant": "t1"},
+        )
+        assert resp.status_code == 400 and resp.json()["detail"].startswith("offset "), bad_offset
+    assert client.get(
+        "/orders/ms6/flow/monthly-summary",
+        params={"start": base["start"], "end": base["end"], "offset": "Z"},
+        headers={"X-Tenant": "t1"},
+    ).status_code == 200
+    resp = _monthly("ms6", "2026-05-31T23:59:59Z", "2026-05-01T00:00:00Z", "+08:00")
+    assert resp.status_code == 400 and resp.json()["detail"] == "start must not be later than end"
+    resp = client.get("/orders/ms6/flow/monthly-summary", params=base)
+    assert resp.status_code == 400 and resp.json()["detail"] == "tenant header is required"
+    # 参数非法时不读任何数据：订单不存在也先返回参数错误
+    resp = client.get(
+        "/orders/ms-nope/flow/monthly-summary",
+        params={"start": "bad", "end": base["end"], "offset": "+08:00"},
+        headers={"X-Tenant": "t1"},
+    )
+    assert resp.status_code == 400
+
+
+def test_monthly_summary_on_missing_or_foreign_order_is_not_found() -> None:
+    resp = _monthly("ms-nope", *_FULL_YEAR, "+08:00")
+    assert resp.status_code == 404
+    _seed_monthly_order("ms7")
+    resp = _monthly("ms7", *_FULL_YEAR, "+08:00", tenant="t2")
+    assert resp.status_code == 404
+
+
+def test_monthly_summary_is_scoped_per_tenant() -> None:
+    _new_order("ms8", 500, tenant="t1")
+    _new_order("ms8", 500, tenant="t2")
+    client.post(
+        "/orders/ms8/payments",
+        json={"amount_cents": 100, "business_time": "2026-05-01T00:00:00Z"},
+        headers={"X-Tenant": "t1"},
+    )
+    client.post(
+        "/orders/ms8/payments",
+        json={"amount_cents": 200, "business_time": "2026-06-02T00:00:00Z"},
+        headers={"X-Tenant": "t2"},
+    )
+    a = _monthly("ms8", *_FULL_YEAR, "Z", tenant="t1").json()["groups"]
+    b = _monthly("ms8", *_FULL_YEAR, "Z", tenant="t2").json()["groups"]
+    assert [(g["month"], g["payment_cents"], g["entry_count"]) for g in a] == [("2026-05", 100, 1)]
+    assert [(g["month"], g["payment_cents"], g["entry_count"]) for g in b] == [("2026-06", 200, 1)]
+
+
+def test_monthly_summary_survives_restart() -> None:
+    from app.store.db import connect
+    _seed_monthly_order("ms9")
+    before = _monthly("ms9", *_FULL_YEAR, "+08:00").json()
+    # 以全新连接模拟服务重启：流水仍在，月汇总结论不变
+    conn = connect()
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) AS n FROM order_flow WHERE tenant='t1' AND order_id='ms9'"
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    assert count == 4
+    after = _monthly("ms9", *_FULL_YEAR, "+08:00").json()
+    assert after == before
