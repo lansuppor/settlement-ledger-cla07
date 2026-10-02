@@ -16,7 +16,13 @@ def connect() -> sqlite3.Connection:
 def migrate() -> None:
     conn = connect()
     try:
+        # 记录已应用的迁移，非幂等脚本（如 ALTER TABLE）只执行一次
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations(name TEXT PRIMARY KEY)")
+        applied = {row[0] for row in conn.execute("SELECT name FROM schema_migrations")}
         for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+            if path.name in applied:
+                continue
             conn.executescript(path.read_text(encoding="utf-8"))
+            conn.execute("INSERT INTO schema_migrations(name) VALUES(?)", (path.name,))
     finally:
         conn.close()

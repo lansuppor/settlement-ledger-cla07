@@ -148,3 +148,199 @@ def test_record_belongs_to_other_order_is_not_found() -> None:
     resp = _reverse("o16b", record_id)
     assert resp.status_code == 404
     assert client.get("/orders/o16a", headers={"X-Tenant": "t1"}).json()["paid_cents"] == 100
+
+
+# ---------- 分期收款 ----------
+
+def _new_order(order_id: str, amount: int, tenant: str = "t1") -> None:
+    resp = client.post("/orders", json={"tenant": tenant, "order_id": order_id, "amount_cents": amount, "currency": "CNY"})
+    assert resp.status_code == 201, resp.text
+
+def _register_plan(order_id: str, installments: list, tenant: str = "t1"):
+    return client.post(f"/orders/{order_id}/installments", json={"installments": installments}, headers={"X-Tenant": tenant})
+
+def _plan(order_id: str, tenant: str = "t1"):
+    return client.get(f"/orders/{order_id}/installments", headers={"X-Tenant": tenant})
+
+def _pay_installment(order_id: str, installment_id: str, amount: int, tenant: str = "t1"):
+    return client.post(
+        f"/orders/{order_id}/payments",
+        json={"amount_cents": amount, "installment_id": installment_id},
+        headers={"X-Tenant": tenant},
+    )
+
+def test_register_plan_and_query() -> None:
+    _new_order("o20", 1000)
+    resp = _register_plan("o20", [
+        {"installment_id": "i1", "amount_cents": 400, "due_at": "2026-11-01"},
+        {"installment_id": "i2", "amount_cents": 600, "due_at": "2026-12-01"},
+    ])
+    assert resp.status_code == 201, resp.text
+    plan = _plan("o20")
+    assert plan.status_code == 200
+    items = plan.json()["installments"]
+    assert [i["installment_id"] for i in items] == ["i1", "i2"]
+    assert [i["amount_cents"] for i in items] == [400, 600]
+    assert [i["due_at"] for i in items] == ["2026-11-01", "2026-12-01"]
+    assert all(i["paid"] is False for i in items)
+
+def test_duplicate_plan_conflicts_and_keeps_original() -> None:
+    _new_order("o21", 500)
+    assert _register_plan("o21", [{"installment_id": "i1", "amount_cents": 500, "due_at": "2026-11-01"}]).status_code == 201
+    replay = _register_plan("o21", [{"installment_id": "j1", "amount_cents": 500, "due_at": "2026-11-01"}])
+    assert replay.status_code == 409
+    assert replay.json()["detail"] == "installment plan already accepted"
+    items = _plan("o21").json()["installments"]
+    assert [i["installment_id"] for i in items] == ["i1"]  # 已受理的计划不被改动
+
+def test_plan_sum_must_equal_order_amount() -> None:
+    _new_order("o22", 500)
+    resp = _register_plan("o22", [
+        {"installment_id": "i1", "amount_cents": 300, "due_at": "2026-11-01"},
+        {"installment_id": "i2", "amount_cents": 100, "due_at": "2026-12-01"},
+    ])
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "installment amounts do not add up to order amount"
+    # 整份计划被拒绝，不留任何一期；订单仍按整单收款
+    assert _plan("o22").status_code == 404
+    assert client.post("/orders/o22/payments", json={"amount_cents": 500}, headers={"X-Tenant": "t1"}).status_code == 200
+
+def test_plan_rejects_duplicate_installment_ids() -> None:
+    _new_order("o23", 500)
+    resp = _register_plan("o23", [
+        {"installment_id": "i1", "amount_cents": 200, "due_at": "2026-11-01"},
+        {"installment_id": "i1", "amount_cents": 300, "due_at": "2026-12-01"},
+    ])
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "duplicate installment_id"
+    assert _plan("o23").status_code == 404
+
+def test_plan_rejects_non_positive_amount() -> None:
+    _new_order("o24", 500)
+    resp = _register_plan("o24", [
+        {"installment_id": "i1", "amount_cents": 0, "due_at": "2026-11-01"},
+        {"installment_id": "i2", "amount_cents": 500, "due_at": "2026-12-01"},
+    ])
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "installment amount must be positive"
+    assert _plan("o24").status_code == 404
+
+def test_plan_missing_or_cross_tenant_order_is_not_found() -> None:
+    _new_order("o25", 500)
+    assert _register_plan("missing-order", [{"installment_id": "i1", "amount_cents": 500, "due_at": "2026-11-01"}]).status_code == 404
+    # 跨租户受理与查询一律按不存在处理
+    assert _register_plan("o25", [{"installment_id": "i1", "amount_cents": 500, "due_at": "2026-11-01"}], tenant="t2").status_code == 404
+    assert _register_plan("o25", [{"installment_id": "i1", "amount_cents": 500, "due_at": "2026-11-01"}]).status_code == 201
+    assert _plan("o25", tenant="t2").status_code == 404
+
+def test_installment_payment_flow_to_settlement() -> None:
+    _new_order("o26", 1000)
+    _register_plan("o26", [
+        {"installment_id": "i1", "amount_cents": 400, "due_at": "2026-11-01"},
+        {"installment_id": "i2", "amount_cents": 600, "due_at": "2026-12-01"},
+    ])
+    resp = _pay_installment("o26", "i1", 400)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["paid_cents"] == 400 and resp.json()["outstanding_cents"] == 600
+    items = _plan("o26").json()["installments"]
+    assert [i["paid"] for i in items] == [True, False]
+    resp = _pay_installment("o26", "i2", 600)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "settled" and resp.json()["paid_cents"] == 1000
+    # 流水中可看到每笔收款对应的期次
+    records = _payments("o26")
+    assert [r["installment_id"] for r in records] == ["i1", "i2"]
+
+def test_installment_order_requires_installment_id() -> None:
+    _new_order("o27", 500)
+    _register_plan("o27", [{"installment_id": "i1", "amount_cents": 500, "due_at": "2026-11-01"}])
+    resp = client.post("/orders/o27/payments", json={"amount_cents": 500}, headers={"X-Tenant": "t1"})
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "installment_id is required for installment order"
+    assert client.get("/orders/o27", headers={"X-Tenant": "t1"}).json()["paid_cents"] == 0
+    assert _payments("o27") == []
+
+def test_installment_payment_amount_must_match() -> None:
+    _new_order("o28", 500)
+    _register_plan("o28", [{"installment_id": "i1", "amount_cents": 500, "due_at": "2026-11-01"}])
+    resp = _pay_installment("o28", "i1", 400)
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "payment amount does not match installment amount"
+    assert _plan("o28").json()["installments"][0]["paid"] is False
+    assert _payments("o28") == []
+
+def test_installment_unknown_is_not_found() -> None:
+    _new_order("o29", 500)
+    _register_plan("o29", [{"installment_id": "i1", "amount_cents": 500, "due_at": "2026-11-01"}])
+    resp = _pay_installment("o29", "nope", 500)
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "installment not found"
+    assert _payments("o29") == []
+
+def test_installment_replay_conflicts_without_double_recording() -> None:
+    _new_order("o30", 500)
+    _register_plan("o30", [{"installment_id": "i1", "amount_cents": 500, "due_at": "2026-11-01"}])
+    assert _pay_installment("o30", "i1", 500).status_code == 200
+    replay = _pay_installment("o30", "i1", 500)
+    assert replay.status_code == 409
+    assert replay.json()["detail"] == "installment already paid"
+    assert len(_payments("o30")) == 1  # 不重复留痕
+
+def test_installment_payment_without_plan_refused() -> None:
+    _new_order("o31", 500)
+    resp = _pay_installment("o31", "i1", 500)
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "installment plan not accepted"
+    assert client.get("/orders/o31", headers={"X-Tenant": "t1"}).json()["paid_cents"] == 0
+
+def test_reversal_returns_installment_to_unpaid() -> None:
+    _new_order("o32", 1000)
+    _register_plan("o32", [
+        {"installment_id": "i1", "amount_cents": 400, "due_at": "2026-11-01"},
+        {"installment_id": "i2", "amount_cents": 600, "due_at": "2026-12-01"},
+    ])
+    _pay_installment("o32", "i1", 400)
+    _pay_installment("o32", "i2", 600)
+    assert client.get("/orders/o32", headers={"X-Tenant": "t1"}).json()["status"] == "settled"
+
+    first = _payments("o32")[0]
+    assert first["installment_id"] == "i1"
+    resp = _reverse("o32", first["record_id"])
+    assert resp.status_code == 201, resp.text
+    order = resp.json()
+    # 账面与该笔收款从未发生完全一致
+    assert order["paid_cents"] == 600 and order["outstanding_cents"] == 400 and order["status"] == "accepted"
+    # 对应期次回到未收
+    items = _plan("o32").json()["installments"]
+    assert [i["paid"] for i in items] == [False, True]
+    # 因果链完整：冲正记录关联原收款，原收款仍标记其期次
+    records = _payments("o32")
+    assert records[-1]["record_type"] == "reversal" and records[-1]["related_record_id"] == first["record_id"]
+    # 期次退回未收后可再次收讫并重新结清
+    assert _pay_installment("o32", "i1", 400).status_code == 200
+    again = client.get("/orders/o32", headers={"X-Tenant": "t1"}).json()
+    assert again["status"] == "settled" and again["paid_cents"] == 1000
+
+def test_concurrent_installment_payment_allows_only_one() -> None:
+    import threading
+
+    from app.store import orders as store
+
+    _new_order("o33", 500)
+    _register_plan("o33", [{"installment_id": "i1", "amount_cents": 500, "due_at": "2026-11-01"}])
+    results = []
+
+    def worker() -> None:
+        try:
+            store.add_payment("t1", "o33", 500, "tester", "i1")
+            results.append("ok")
+        except store.LedgerError:
+            results.append("conflict")
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(results) == ["conflict", "ok"]  # 同一期次并发收款至多一笔成功
+    assert len(_payments("o33")) == 1
