@@ -4,6 +4,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.rules import order_rules
+from app.store import imports as import_store
 from app.store import orders
 from app.store.db import connect, migrate
 from app.store.orders import LedgerError
@@ -32,6 +33,10 @@ class InstallmentIn(BaseModel):
 
 class PlanIn(BaseModel):
     installments: list[InstallmentIn] = Field(min_length=1)
+
+class PaymentImportIn(BaseModel):
+    # 服务端本地可读取的 CSV 文件路径；发起方标识沿用 X-Originator 请求头（缺省取租户）
+    file_path: str = Field(min_length=1)
 
 @app.get("/health")
 def health() -> dict:
@@ -148,6 +153,31 @@ def refund_payment(order_id: str, record_id: str, body: RefundIn, x_tenant: str 
     if order is None:
         raise HTTPException(status_code=404, detail="order not found")
     return order
+
+@app.post("/payment-imports", status_code=201)
+def create_payment_import(body: PaymentImportIn, x_tenant: str = Header(default=""), x_originator: str = Header(default="")) -> dict:
+    """批量收款导入：按文件逐行受理收款，部分失败可解释、可续跑、可重放。
+
+    同一（文件路径, 发起方）重复提交视为同一批次：返回首次导入的逐行结论，
+    不重复记账、不重复留痕；中断的批次再次提交只补齐剩余行。
+    """
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    originator = x_originator or x_tenant
+    try:
+        return import_store.run_import(x_tenant, body.file_path, originator)
+    except import_store.ImportFileError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+@app.get("/payment-imports/{batch_id}")
+def read_payment_import(batch_id: str, x_tenant: str = Header(default="")) -> dict:
+    """按批次标识查询本次导入的逐行结论；跨租户/不存在一律 404，不泄漏对象是否存在。"""
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    batch = import_store.get_import(x_tenant, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="import batch not found")
+    return batch
 
 def main() -> None:
     parser = argparse.ArgumentParser()

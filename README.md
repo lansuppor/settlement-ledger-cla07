@@ -27,6 +27,8 @@
 - `POST /orders/{order_id}/payments/{record_id}/refund`：对一笔已登记的收款登记退款（支持部分退款）。请求字段 `amount_cents`，分期收款必须同时声明 `installment_id`。成功返回 201 与退款后的订单对象，并写入一条 `related_record_id` 关联原收款流水的 `refund` 记录。退款后订单已收金额按净收款（收款−冲正−退款）相应减少，未收金额按“订单金额−净收款”重算：未收转为正数的订单不再结清，净收款全部退完的订单回到未收款状态。失败原因可区分：订单不存在或跨租户返回 404（`order not found`，不泄漏对象是否存在）；原收款流水不存在或不属于该订单/租户返回 404（`payment record not found`）；金额非正返回 409（`refund amount must be positive`）；超过该订单可退余额（当前净收款）或该笔收款剩余可退额返回 409（`refund exceeds refundable amount`）；分期退款未声明期次 409（`installment id is required`）、期次不存在 409（`installment not found`）、该期未收讫 409（`installment is not paid`）、退款金额不等于该期已收金额 409（`refund amount does not match installment amount`）；整单退款声明期次返回 409（`installment plan not accepted`）；同一退款请求（同订单、同原收款、同金额、同期次）重放返回 409（`refund already applied`）。任一失败都不改动已收、未收、状态、期次状态与流水。分期退款成功后该期回到未收并清空 `paid_record_id`，可再次收讫。
 - `POST /orders/{order_id}/installments`：受理分期计划。请求字段 `installments` 为若干期明细，每期含 `installment_id`（期次标识）、`amount_cents`（应收金额）、`due_at`（到期时间）。成功返回 201 与完整计划；各期金额之和必须等于订单金额、期次标识不得重复、金额必须为正，任一不合法整份拒绝且不留任何一期（金额求和不符 409 `installment amounts do not add up to order amount`，期次重复 409 `duplicate installment id`，非正金额 422）；同一订单重复受理返回 409（`installment plan already accepted`）且不改动已受理计划；订单不存在或跨租户返回 404。
 - `GET /orders/{order_id}/installments`：分期计划查询。返回该订单各期的 `installment_id`、`amount_cents`、`due_at`、`status`（`unpaid` / `paid`）与 `paid_record_id`（收讫该期的收款流水标识）；未受理计划时返回空列表；订单不存在或跨租户返回 404。
+- `POST /payment-imports`：批量收款导入。请求字段 `file_path`（服务端可读的 CSV 路径），租户经 `X-Tenant` 传入、发起方经 `X-Originator` 传入（缺省沿用单笔收款规则取租户标识）。CSV 表头为 `order_id,amount_cents` 或 `order_id,amount_cents,installment_id`，按行的先后顺序逐行受理，每行的校验与账面推进与对该订单单笔登记收款完全一致。任一行不合法只拒绝该行（无半行残留），不影响其他行；成功行给出受理后的 `paid_cents`、`outstanding_cents`、`order_status` 与 `record_id`，失败行给出与单笔收款一致的 `reject_reason`（文件内格式错误行为 `order id is required` / `invalid amount_cents` / `invalid payment line`；订单不存在含跨租户为 `order not found`，不泄漏对象是否存在）。响应含可查询的 `batch_id` 与逐行 `results`。同一（文件路径, 发起方）重复提交视为同一批次，返回首次结论、不重复记账留痕；服务中断后重新提交只补齐剩余行。文件缺失或表头错误返回 400。
+- `GET /payment-imports/{batch_id}`：按批次标识查询逐行结论（含中断批次中 `result` 为 `pending` 的未完成行）；批次不存在或跨租户返回 404（`import batch not found`），不泄漏对象是否存在。导入成功行写入的收款流水与单笔收款完全同构，可正常冲正与退款。
 - 分期订单的收款：受理分期计划后，`POST /orders/{order_id}/payments` 必须声明 `installment_id`，且 `amount_cents` 必须等于该期应收。失败原因可区分：未声明期次 409（`installment id is required`）、金额不等 409（`payment amount does not match installment amount`）、期次不存在 409（`installment not found`）、期次已收讫 409（`installment already paid`）、未受理计划却按期次收款 409（`installment plan not accepted`）；任一失败都不改动账面与留痕。同一期次并发收款至多一笔成功。全部期次收讫时订单结清。收款流水的 `installment_id` 字段记录对应期次（整单收款为 `null`）。
 - `GET /health`：返回服务与数据库状态。
 
@@ -70,6 +72,21 @@ curl -s -XPOST localhost:8000/orders/o2/payments \
 
 # 查询分期计划与各期收讫状态
 curl -s localhost:8000/orders/o2/installments -H 'X-Tenant: t1'
+
+# 准备批量导入文件（表头 order_id,amount_cents[,installment_id]）
+cat > /tmp/payments.csv <<'CSV'
+order_id,amount_cents,installment_id
+o1,400,
+o2,300,i1
+CSV
+
+# 批量导入收款：返回 batch_id 与逐行结论（成功行含受理后账面，失败行含可区分原因）
+curl -s -XPOST localhost:8000/payment-imports \
+  -H 'X-Tenant: t1' -H 'X-Originator: alice' -H 'Content-Type: application/json' \
+  -d '{"file_path": "/tmp/payments.csv"}'
+
+# 凭批次标识随时查询逐行结论；同一文件路径+发起方重复提交返回同一批次、不重复记账
+curl -s localhost:8000/payment-imports/imp_ab12... -H 'X-Tenant: t1'
 ```
 
 ## 数据与配置
