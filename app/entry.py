@@ -20,6 +20,11 @@ class PaymentIn(BaseModel):
     amount_cents: int = Field(gt=0)
     installment_id: str | None = Field(default=None, min_length=1)
 
+class RefundIn(BaseModel):
+    # 金额为正的业务校验在账本内完成，非正金额返回 409 的可区分原因
+    amount_cents: int
+    installment_id: str | None = Field(default=None, min_length=1)
+
 class InstallmentIn(BaseModel):
     installment_id: str = Field(min_length=1)
     amount_cents: int = Field(gt=0)
@@ -115,6 +120,26 @@ def reverse_payment(order_id: str, record_id: str, x_tenant: str = Header(defaul
     originator = x_originator or x_tenant
     try:
         order = orders.reverse_payment(x_tenant, order_id, record_id, originator)
+    except LedgerError as error:
+        detail = str(error)
+        if detail == "payment record not found":
+            raise HTTPException(status_code=404, detail=detail)
+        raise HTTPException(status_code=409, detail=detail)
+    if order is None:
+        raise HTTPException(status_code=404, detail="order not found")
+    return order
+
+@app.post("/orders/{order_id}/payments/{record_id}/refund", status_code=201)
+def refund_payment(order_id: str, record_id: str, body: RefundIn, x_tenant: str = Header(default=""), x_originator: str = Header(default="")) -> dict:
+    """对一笔已登记的收款登记退款（支持部分退款）。"""
+    if not x_tenant:
+        raise HTTPException(status_code=400, detail="tenant header is required")
+    originator = x_originator or x_tenant
+    try:
+        order = orders.refund_payment(
+            x_tenant, order_id, record_id, body.amount_cents, originator,
+            installment_id=body.installment_id,
+        )
     except LedgerError as error:
         detail = str(error)
         if detail == "payment record not found":

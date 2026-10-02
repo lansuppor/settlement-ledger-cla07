@@ -18,6 +18,13 @@ INSTALLMENT_NOT_FOUND = "installment not found"
 INSTALLMENT_ALREADY_PAID = "installment already paid"
 INSTALLMENT_AMOUNT_MISMATCH = "payment amount does not match installment amount"
 
+# 退款相关的可区分业务拒绝原因
+REFUND_ALREADY_APPLIED = "refund already applied"
+REFUND_AMOUNT_NOT_POSITIVE = "refund amount must be positive"
+REFUND_EXCEEDS_REFUNDABLE = "refund exceeds refundable amount"
+REFUND_INSTALLMENT_NOT_PAID = "installment is not paid"
+REFUND_INSTALLMENT_AMOUNT_MISMATCH = "refund amount does not match installment amount"
+
 
 class LedgerError(Exception):
     """账本业务规则冲突（HTTP 层映射为 409）。"""
@@ -181,6 +188,138 @@ def reverse_payment(tenant: str, order_id: str, record_id: str, originator: str)
             )
         conn.execute(
             "UPDATE orders SET paid_cents=?, status=CASE WHEN ? >= amount_cents THEN 'settled' ELSE 'accepted' END WHERE tenant=? AND order_id=?",
+            (new_paid, new_paid, tenant, order_id),
+        )
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    return get(tenant, order_id)
+
+
+def refund_payment(
+    tenant: str,
+    order_id: str,
+    record_id: str,
+    amount_cents: int,
+    originator: str,
+    installment_id: str | None = None,
+) -> dict | None:
+    """登记一笔退款并推进账面/期次/流水。
+
+    订单不存在（含跨租户）返回 None；原收款流水不存在或不属于该订单/租户抛
+    LedgerError("payment record not found")；其余业务冲突抛可区分的 LedgerError。
+    paid_cents 始终为“收款−冲正−退款”的净收款；账面推进、期次回退与退款留痕
+    在同一事务内原子提交。同一退款请求（同订单、同原收款、同金额、同期次）重放只生效一次。
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        order = conn.execute(
+            "SELECT amount_cents, paid_cents FROM orders WHERE tenant=? AND order_id=?",
+            (tenant, order_id),
+        ).fetchone()
+        if order is None:
+            conn.execute("ROLLBACK")
+            return None
+
+        # 只能退属于当前租户、且挂在该订单下的收款；否则一律按流水不存在处理
+        payment = conn.execute(
+            "SELECT amount_cents, installment_id FROM payment_records "
+            "WHERE tenant=? AND order_id=? AND record_id=? AND record_type='payment'",
+            (tenant, order_id, record_id),
+        ).fetchone()
+        if payment is None:
+            conn.execute("ROLLBACK")
+            raise LedgerError("payment record not found")
+
+        if amount_cents is None or amount_cents <= 0:
+            conn.execute("ROLLBACK")
+            raise LedgerError(REFUND_AMOUNT_NOT_POSITIVE)
+
+        paid_installment_id = payment["installment_id"]
+        if paid_installment_id:
+            # 分期收款的退款必须声明期次，且只能退该期当前已收的金额
+            if not installment_id:
+                conn.execute("ROLLBACK")
+                raise LedgerError(INSTALLMENT_ID_REQUIRED)
+            installment = conn.execute(
+                "SELECT amount_cents, status, paid_record_id FROM installments "
+                "WHERE tenant=? AND order_id=? AND installment_id=?",
+                (tenant, order_id, installment_id),
+            ).fetchone()
+            if installment is None:
+                conn.execute("ROLLBACK")
+                raise LedgerError(INSTALLMENT_NOT_FOUND)
+            if installment["status"] != "paid" or installment["paid_record_id"] != record_id:
+                # 该期未收讫（从未收、已退或已冲正后回到未收）：不可退
+                conn.execute("ROLLBACK")
+                raise LedgerError(REFUND_INSTALLMENT_NOT_PAID)
+            if amount_cents != installment["amount_cents"]:
+                conn.execute("ROLLBACK")
+                raise LedgerError(REFUND_INSTALLMENT_AMOUNT_MISMATCH)
+            refund_installment_id = installment_id
+        else:
+            # 整单收款的退款无需也不得声明期次
+            if installment_id:
+                conn.execute("ROLLBACK")
+                raise LedgerError(PLAN_NOT_ACCEPTED)
+            refund_installment_id = None
+
+        # 该笔原收款自身的可退余额 = 原额 − 已挂在它名下的退款（支持部分退款）
+        refunded_on_payment = conn.execute(
+            "SELECT COALESCE(SUM(amount_cents), 0) AS total FROM payment_records "
+            "WHERE tenant=? AND order_id=? AND record_type='refund' AND related_record_id=?",
+            (tenant, order_id, record_id),
+        ).fetchone()["total"]
+        remaining_on_payment = payment["amount_cents"] - refunded_on_payment
+
+        # 重放判定先于余额判定：同额、同期次的退款即同一请求，重放不重复扣减/留痕
+        duplicate = conn.execute(
+            "SELECT 1 FROM payment_records "
+            "WHERE tenant=? AND order_id=? AND record_type='refund' AND related_record_id=? "
+            "AND amount_cents=? AND COALESCE(installment_id, '')=COALESCE(?, '')",
+            (tenant, order_id, record_id, amount_cents, refund_installment_id),
+        ).fetchone()
+        if duplicate is not None:
+            conn.execute("ROLLBACK")
+            raise LedgerError(REFUND_ALREADY_APPLIED)
+
+        if amount_cents > remaining_on_payment:
+            # 超过该收款的可退余额（分期路径此处恒为整额，通常由上面的期次校验拦截）
+            conn.execute("ROLLBACK")
+            raise LedgerError(REFUND_EXCEEDS_REFUNDABLE)
+
+        # 订单级可退余额即当前净收款（已收毛额−已退−已冲正）；不得退成负数
+        if amount_cents > order["paid_cents"]:
+            conn.execute("ROLLBACK")
+            raise LedgerError(REFUND_EXCEEDS_REFUNDABLE)
+
+        new_paid = order["paid_cents"] - amount_cents
+        refund_id = _new_record_id("ref")
+        try:
+            conn.execute(
+                """INSERT INTO payment_records(tenant, order_id, record_id, record_type, amount_cents,
+                                                originator, related_record_id, created_at, installment_id)
+                   VALUES(?,?,?,'refund',?,?,?,?,?)""",
+                (tenant, order_id, refund_id, amount_cents, originator, record_id, _now(),
+                 refund_installment_id),
+            )
+        except sqlite3.IntegrityError:
+            # 唯一索引兜底：并发或重放下同一退款只允许一笔，账面不变更、不留痕
+            conn.execute("ROLLBACK")
+            raise LedgerError(REFUND_ALREADY_APPLIED)
+
+        if refund_installment_id:
+            # 该期回到未收、清空收讫流水引用，可再次收讫
+            conn.execute(
+                "UPDATE installments SET status='unpaid', paid_record_id=NULL "
+                "WHERE tenant=? AND order_id=? AND installment_id=?",
+                (tenant, order_id, refund_installment_id),
+            )
+        # 未收 = 订单金额 − 净收款；净收款退完（净额 0）回到未收款状态，未收转正即不再结清
+        conn.execute(
+            "UPDATE orders SET paid_cents=?, status=CASE WHEN ? >= amount_cents THEN 'settled' ELSE 'accepted' END "
+            "WHERE tenant=? AND order_id=?",
             (new_paid, new_paid, tenant, order_id),
         )
         conn.execute("COMMIT")

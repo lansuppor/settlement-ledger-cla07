@@ -359,3 +359,267 @@ def test_concurrent_payment_on_same_installment_only_one_wins() -> None:
     # 不重复留痕、账面只推进一次
     assert client.get("/orders/o34", headers={"X-Tenant": "t1"}).json()["paid_cents"] == 300
     assert len(_payments("o34")) == 1
+
+
+# ---------- 退款 ----------
+
+def _refund(order_id: str, record_id: str, amount: int, tenant: str = "t1", installment_id: str | None = None,
+            originator: str | None = None):
+    headers = {"X-Tenant": tenant}
+    if originator:
+        headers["X-Originator"] = originator
+    body = {"amount_cents": amount}
+    if installment_id is not None:
+        body["installment_id"] = installment_id
+    return client.post(f"/orders/{order_id}/payments/{record_id}/refund", json=body, headers=headers)
+
+
+def test_partial_refund_advances_books_and_writes_trace() -> None:
+    _new_order("o40")
+    _pay("o40", 500, originator="alice")
+    payment_id = _payments("o40")[0]["record_id"]
+
+    resp = _refund("o40", payment_id, 200)
+    assert resp.status_code == 201, resp.text
+    order = resp.json()
+    # 已收按净额减少，未收按“订单金额−净收款”重算
+    assert order["paid_cents"] == 300
+    assert order["outstanding_cents"] == 700
+    assert order["status"] == "accepted"
+
+    records = _payments("o40")
+    assert [r["record_type"] for r in records] == ["payment", "refund"]
+    refund = records[-1]
+    assert refund["amount_cents"] == 200
+    assert refund["related_record_id"] == payment_id  # 因果链：退款关联原收款
+    assert refund["installment_id"] is None
+    assert refund["originator"] == "t1" and refund["record_id"] and refund["created_at"]
+
+
+def test_refund_releases_settled_order_and_full_refund_returns_to_unpaid() -> None:
+    _new_order("o41")
+    _pay("o41", 400)
+    _pay("o41", 600)  # 结清
+    assert client.get("/orders/o41", headers={"X-Tenant": "t1"}).json()["status"] == "settled"
+    first_payment = _payments("o41")[0]["record_id"]
+
+    # 未收变为正数后不再视为结清
+    resp = _refund("o41", first_payment, 400)
+    order = resp.json()
+    assert order["paid_cents"] == 600 and order["outstanding_cents"] == 400
+    assert order["status"] == "accepted"
+
+    # 净收款全部退完：回到未收款状态，之后可再次收款并重新结清
+    second_payment = _payments("o41")[1]["record_id"]
+    fully = _refund("o41", second_payment, 600)
+    assert fully.json()["paid_cents"] == 0
+    assert fully.json()["outstanding_cents"] == 1000
+    assert fully.json()["status"] == "accepted"
+    _pay("o41", 1000)  # 内部断言 200
+    assert client.get("/orders/o41", headers={"X-Tenant": "t1"}).json()["status"] == "settled"
+
+
+def test_multiple_partial_refunds_on_same_payment() -> None:
+    _new_order("o42")
+    _pay("o42", 500)
+    payment_id = _payments("o42")[0]["record_id"]
+
+    assert _refund("o42", payment_id, 200).status_code == 201
+    assert _refund("o42", payment_id, 100).status_code == 201  # 不同金额的第二笔部分退款
+    order = client.get("/orders/o42", headers={"X-Tenant": "t1"}).json()
+    assert order["paid_cents"] == 200 and order["outstanding_cents"] == 800
+    # 超过该收款剩余可退余额（200）：冲突
+    resp = _refund("o42", payment_id, 250)
+    assert resp.status_code == 409 and resp.json()["detail"] == "refund exceeds refundable amount"
+    assert client.get("/orders/o42", headers={"X-Tenant": "t1"}).json()["paid_cents"] == 200
+    assert len([r for r in _payments("o42") if r["record_type"] == "refund"]) == 2
+
+
+def test_refund_cannot_exceed_order_net_collected() -> None:
+    _new_order("o43")
+    _pay("o43", 600)
+    _pay("o43", 400)
+    first_payment = _payments("o43")[0]["record_id"]
+    # 该笔原收款只剩 600 可退；尝试超过订单净收款/可退余额被拒
+    resp = _refund("o43", first_payment, 700)
+    assert resp.status_code == 409 and resp.json()["detail"] == "refund exceeds refundable amount"
+    order = client.get("/orders/o43", headers={"X-Tenant": "t1"}).json()
+    assert order["paid_cents"] == 1000 and order["status"] == "settled"
+    assert all(r["record_type"] == "payment" for r in _payments("o43"))
+
+
+def test_refund_non_positive_amount_is_conflict() -> None:
+    _new_order("o44")
+    _pay("o44", 500)
+    payment_id = _payments("o44")[0]["record_id"]
+    for bad in (0, -100):
+        resp = _refund("o44", payment_id, bad)
+        assert resp.status_code == 409 and resp.json()["detail"] == "refund amount must be positive"
+    order = client.get("/orders/o44", headers={"X-Tenant": "t1"}).json()
+    assert order["paid_cents"] == 500
+    assert all(r["record_type"] == "payment" for r in _payments("o44"))
+
+
+def test_refund_replay_is_effective_only_once() -> None:
+    _new_order("o45")
+    _pay("o45", 500)
+    payment_id = _payments("o45")[0]["record_id"]
+    assert _refund("o45", payment_id, 200).status_code == 201
+    # 同一退款请求重放（同订单、同原收款、同金额）：冲突且不重复扣减、不重复留痕
+    replay = _refund("o45", payment_id, 200)
+    assert replay.status_code == 409 and replay.json()["detail"] == "refund already applied"
+    order = client.get("/orders/o45", headers={"X-Tenant": "t1"}).json()
+    assert order["paid_cents"] == 300
+    assert len([r for r in _payments("o45") if r["record_type"] == "refund"]) == 1
+
+
+def test_refund_unknown_order_or_record_is_not_found() -> None:
+    resp = _refund("missing-order", "pay_whatever", 10)
+    assert resp.status_code == 404 and resp.json()["detail"] == "order not found"
+
+    _new_order("o46")
+    _pay("o46", 100)
+    resp = _refund("o46", "pay_does_not_exist", 10)
+    assert resp.status_code == 404 and resp.json()["detail"] == "payment record not found"
+    order = client.get("/orders/o46", headers={"X-Tenant": "t1"}).json()
+    assert order["paid_cents"] == 100 and len(_payments("o46")) == 1
+
+
+def test_refund_record_of_other_order_or_tenant_is_not_found() -> None:
+    for oid in ("o47a", "o47b"):
+        client.post("/orders", json={"tenant": "t1", "order_id": oid, "amount_cents": 500, "currency": "CNY"})
+    _pay("o47a", 100)
+    record_id = _payments("o47a")[0]["record_id"]
+    # 流水不属于路径上的订单：按不存在处理
+    assert _refund("o47b", record_id, 50).status_code == 404
+    # 跨租户：一律按订单不存在处理，t1 账面与流水不变
+    assert _refund("o47a", record_id, 50, tenant="t2").status_code == 404
+    assert client.get("/orders/o47a", headers={"X-Tenant": "t1"}).json()["paid_cents"] == 100
+    assert all(r["record_type"] == "payment" for r in _payments("o47a"))
+
+
+def test_records_list_payments_refunds_reversals_in_order_for_full_causal_chain() -> None:
+    _new_order("o48")
+    _pay("o48", 600)
+    first_payment = _payments("o48")[0]["record_id"]
+    _refund("o48", first_payment, 200)  # 部分退款：净收款 400
+    _pay("o48", 400)  # 再收一笔：净收款 800
+    second_payment = _payments("o48")[-1]["record_id"]
+    assert _reverse("o48", second_payment).status_code == 201  # 冲正第二笔：净收款 400
+
+    records = _payments("o48")
+    types = [r["record_type"] for r in records]
+    assert types == ["payment", "refund", "payment", "reversal"]
+    # 退款与冲正都通过原流水标识关联原收款，可重建收讫到退回的完整因果链
+    assert records[1]["related_record_id"] == first_payment
+    assert records[3]["related_record_id"] == second_payment
+    assert client.get("/orders/o48", headers={"X-Tenant": "t1"}).json()["paid_cents"] == 400
+
+
+def test_refund_on_reversed_whole_payment_is_refused() -> None:
+    _new_order("o49")
+    _pay("o49", 500)
+    payment_id = _payments("o49")[0]["record_id"]
+    assert _reverse("o49", payment_id).status_code == 201
+    # 冲正后净收款为 0：退款超过可退余额，账面与流水不变
+    resp = _refund("o49", payment_id, 100)
+    assert resp.status_code == 409 and resp.json()["detail"] == "refund exceeds refundable amount"
+    assert client.get("/orders/o49", headers={"X-Tenant": "t1"}).json()["paid_cents"] == 0
+    assert [r["record_type"] for r in _payments("o49")] == ["payment", "reversal"]
+
+
+def test_installment_refund_returns_installment_to_unpaid_and_clears_record_ref() -> None:
+    _new_order("o50")
+    _register_plan("o50", PLAN_ITEMS)
+    _pay_installment("o50", "i1", 300)
+    _pay_installment("o50", "i2", 700)  # 全部收讫，订单结清
+    i1_payment = _payments("o50")[0]["record_id"]
+
+    resp = _refund("o50", i1_payment, 300, installment_id="i1")
+    assert resp.status_code == 201, resp.text
+    order = resp.json()
+    assert order["paid_cents"] == 700 and order["outstanding_cents"] == 300
+    assert order["status"] == "accepted"
+
+    plan = {i["installment_id"]: i for i in _plan("o50")}
+    # 该期回到未收，收讫流水引用清空，可再次收讫
+    assert plan["i1"]["status"] == "unpaid" and plan["i1"]["paid_record_id"] is None
+    assert plan["i2"]["status"] == "paid"
+
+    refund = _payments("o50")[-1]
+    assert refund["record_type"] == "refund"
+    assert refund["related_record_id"] == i1_payment and refund["installment_id"] == "i1"
+
+    assert _pay_installment("o50", "i1", 300).status_code == 200
+    assert client.get("/orders/o50", headers={"X-Tenant": "t1"}).json()["status"] == "settled"
+
+
+def test_installment_refund_can_target_new_payment_after_cycle() -> None:
+    _new_order("o51")
+    _register_plan("o51", PLAN_ITEMS)
+    _pay_installment("o51", "i1", 300)
+    first_payment = _payments("o51")[0]["record_id"]
+    assert _refund("o51", first_payment, 300, installment_id="i1").status_code == 201
+    # 重放旧退款：期次已回到未收 → 可区分的“期次未收讫”，账面不变
+    replay = _refund("o51", first_payment, 300, installment_id="i1")
+    assert replay.status_code == 409 and replay.json()["detail"] == "installment is not paid"
+
+    # 再次收讫后是一笔全新收款，可对其退款
+    _pay_installment("o51", "i1", 300)
+    new_payment = _payments("o51")[-1]["record_id"]
+    assert new_payment != first_payment
+    assert _refund("o51", new_payment, 300, installment_id="i1").status_code == 201
+    assert {i["installment_id"]: i for i in _plan("o51")}["i1"]["status"] == "unpaid"
+
+
+def test_installment_refund_failure_reasons_are_distinguishable() -> None:
+    _new_order("o52")
+    _register_plan("o52", PLAN_ITEMS)
+    _pay_installment("o52", "i1", 300)
+    i1_payment = _payments("o52")[0]["record_id"]
+
+    # 分期收款的退款未声明期次
+    resp = _refund("o52", i1_payment, 300)
+    assert resp.status_code == 409 and resp.json()["detail"] == "installment id is required"
+    # 期次不存在
+    resp = _refund("o52", i1_payment, 300, installment_id="i9")
+    assert resp.status_code == 409 and resp.json()["detail"] == "installment not found"
+    # 只能退该期已收金额（金额不等）
+    resp = _refund("o52", i1_payment, 200, installment_id="i1")
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "refund amount does not match installment amount"
+    # 声明的期次与原收款不属同一期（i2 未收讫）
+    resp = _refund("o52", i1_payment, 700, installment_id="i2")
+    assert resp.status_code == 409 and resp.json()["detail"] == "installment is not paid"
+
+    # 任一失败都不改账面、期次状态与流水
+    order = client.get("/orders/o52", headers={"X-Tenant": "t1"}).json()
+    assert order["paid_cents"] == 300
+    plan = {i["installment_id"]: i for i in _plan("o52")}
+    assert plan["i1"]["status"] == "paid" and plan["i1"]["paid_record_id"] == i1_payment
+    assert all(r["record_type"] == "payment" for r in _payments("o52"))
+
+
+def test_whole_payment_refund_must_not_declare_installment() -> None:
+    _new_order("o53")
+    _pay("o53", 500)  # 未受理分期计划的整单收款
+    payment_id = _payments("o53")[0]["record_id"]
+    resp = _refund("o53", payment_id, 100, installment_id="i1")
+    assert resp.status_code == 409 and resp.json()["detail"] == "installment plan not accepted"
+    assert client.get("/orders/o53", headers={"X-Tenant": "t1"}).json()["paid_cents"] == 500
+    assert all(r["record_type"] == "payment" for r in _payments("o53"))
+
+
+def test_installment_refund_requires_tenant_header_and_is_cross_tenant_safe() -> None:
+    _new_order("o54")
+    _register_plan("o54", PLAN_ITEMS)
+    _pay_installment("o54", "i1", 300)
+    payment_id = _payments("o54")[0]["record_id"]
+    body = {"amount_cents": 300, "installment_id": "i1"}
+    assert client.post(f"/orders/o54/payments/{payment_id}/refund", json=body).status_code == 400
+    # 跨租户退款按订单不存在处理，t1 账面、期次、流水不变
+    assert _refund("o54", payment_id, 300, installment_id="i1", tenant="t2").status_code == 404
+    order = client.get("/orders/o54", headers={"X-Tenant": "t1"}).json()
+    assert order["paid_cents"] == 300
+    assert {i["installment_id"]: i for i in _plan("o54")}["i1"]["status"] == "paid"
+    assert all(r["record_type"] == "payment" for r in _payments("o54"))
