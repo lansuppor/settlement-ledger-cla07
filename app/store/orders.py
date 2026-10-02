@@ -25,6 +25,9 @@ REFUND_EXCEEDS_REFUNDABLE = "refund exceeds refundable amount"
 REFUND_INSTALLMENT_NOT_PAID = "installment is not paid"
 REFUND_INSTALLMENT_AMOUNT_MISMATCH = "refund amount does not match installment amount"
 
+# 幂等键被同一租户内参数不同的收款请求复用（订单、金额或期次声明不一致）
+IDEMPOTENCY_KEY_CONFLICT = "idempotency key conflict"
+
 
 class LedgerError(Exception):
     """账本业务规则冲突（HTTP 层映射为 409）。"""
@@ -138,22 +141,116 @@ def _apply_payment(
     }
 
 
-def add_payment(tenant: str, order_id: str, amount_cents: int, originator: str, installment_id: str | None = None) -> dict | None:
+def _stored_idempotent_result(conn: sqlite3.Connection, tenant: str, row: sqlite3.Row) -> dict:
+    """用已落库的幂等登记重建首次成功时的响应：账面快照取首次落库值，
+    金额/币种等不可变字段随订单补齐，另带首次收款流水标识。"""
+    order = conn.execute(
+        "SELECT amount_cents, currency FROM orders WHERE tenant=? AND order_id=?",
+        (tenant, row["order_id"]),
+    ).fetchone()
+    return {
+        "tenant": tenant,
+        "order_id": row["order_id"],
+        "amount_cents": order["amount_cents"],
+        "currency": order["currency"],
+        "paid_cents": row["paid_cents"],
+        "outstanding_cents": row["outstanding_cents"],
+        "status": row["order_status"],
+        "record_id": row["record_id"],
+    }
+
+
+_IDEMPOTENCY_COLUMNS = (
+    "order_id, installment_id, amount_cents, record_id, paid_cents, "
+    "outstanding_cents, order_status"
+)
+
+
+def _idempotency_conflicts(row: sqlite3.Row, order_id: str, amount_cents: int, installment_id: str | None) -> bool:
+    """同一幂等键的请求指纹必须与首次一致：订单、金额、期次声明任一不同即冲突。"""
+    return (
+        row["order_id"] != order_id
+        or row["amount_cents"] != amount_cents
+        or (row["installment_id"] or "") != (installment_id or "")
+    )
+
+
+def add_payment(
+    tenant: str,
+    order_id: str,
+    amount_cents: int,
+    originator: str,
+    installment_id: str | None = None,
+    idempotency_key: str | None = None,
+) -> dict | None:
+    """登记一笔收款。
+
+    未声明 idempotency_key 时行为与既有单笔收款完全一致。声明后，幂等键在租户内
+    唯一标识一次收款意图：键的查重、业务校验、入账与幂等留痕在同一事务内完成——
+    重放命中已落库登记时不重复入账、不重复写流水，直接返回首次成功时的账面快照与
+    收款流水标识；同键但订单/金额/期次声明不同抛 IDEMPOTENCY_KEY_CONFLICT；
+    业务校验失败随事务回滚，不写入幂等登记，即失败不占用幂等键。
+    """
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if idempotency_key is not None:
+            existing = conn.execute(
+                f"SELECT {_IDEMPOTENCY_COLUMNS} FROM payment_idempotency WHERE tenant=? AND idempotency_key=?",
+                (tenant, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                # 命中先于订单存在性判定：同键指向不同订单本身就是请求意图冲突
+                if _idempotency_conflicts(existing, order_id, amount_cents, installment_id):
+                    conn.execute("ROLLBACK")
+                    raise LedgerError(IDEMPOTENCY_KEY_CONFLICT)
+                # 重复请求：只读重放首次结果，不改动账面、期次状态与流水
+                result = _stored_idempotent_result(conn, tenant, existing)
+                conn.execute("ROLLBACK")
+                return result
+
         try:
-            result = _apply_payment(conn, tenant, order_id, amount_cents, originator, installment_id)
+            applied = _apply_payment(conn, tenant, order_id, amount_cents, originator, installment_id)
         except LedgerError:
+            # 超额、期次已收讫等拒绝：整事务回滚，幂等键不被占用、无任何留痕
             conn.execute("ROLLBACK")
             raise
-        if result is None:
+        if applied is None:
             conn.execute("ROLLBACK")
             return None
+
+        if idempotency_key is not None:
+            try:
+                # 仅在收款入账成功后占用幂等键：留痕与账面在同一事务内原子提交
+                conn.execute(
+                    """INSERT INTO payment_idempotency(tenant, idempotency_key, order_id, installment_id,
+                                                        amount_cents, record_id, paid_cents, outstanding_cents,
+                                                        order_status, created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        tenant, idempotency_key, order_id, installment_id or "", amount_cents,
+                        applied["record_id"], applied["paid_cents"], applied["outstanding_cents"],
+                        applied["status"], _now(),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # 并发兜底：BEGIN IMMEDIATE 已将写事务串行化，此处防同键被并发抢先落库。
+                # 本笔收款随回滚撤销，再以已存在的登记为准：指纹一致则重放首次结果，否则明确冲突
+                conn.execute("ROLLBACK")
+                winner = conn.execute(
+                    f"SELECT {_IDEMPOTENCY_COLUMNS} FROM payment_idempotency WHERE tenant=? AND idempotency_key=?",
+                    (tenant, idempotency_key),
+                ).fetchone()
+                if winner is None or _idempotency_conflicts(winner, order_id, amount_cents, installment_id):
+                    raise LedgerError(IDEMPOTENCY_KEY_CONFLICT)
+                return _stored_idempotent_result(conn, tenant, winner)
         conn.execute("COMMIT")
     finally:
         conn.close()
-    return get(tenant, order_id)
+    order = get(tenant, order_id)
+    if idempotency_key is not None:
+        order["record_id"] = applied["record_id"]
+    return order
 
 
 def reverse_payment(tenant: str, order_id: str, record_id: str, originator: str) -> dict | None:
